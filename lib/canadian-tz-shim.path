@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for tzdata updates and reapply Canadian timezone shim
+
+[Path]
+PathModified=/usr/share/zoneinfo/America/Vancouver
+PathModified=/usr/share/zoneinfo/America/Edmonton
+PathModified=/usr/share/zoneinfo/America/Whitehorse
+PathModified=/usr/share/zoneinfo/America/Dawson
+PathModified=/usr/share/zoneinfo/America/Winnipeg
+PathModified=/usr/share/zoneinfo/America/Yellowknife
+
+[Install]
+WantedBy=multi-user.target

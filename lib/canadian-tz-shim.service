@@ -1,0 +1,9 @@
+[Unit]
+Description=Reapply Canadian timezone shim after tzdata update
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/canadian-tz-shim/reapply.sh
+StandardOutput=journal
+StandardError=journal
