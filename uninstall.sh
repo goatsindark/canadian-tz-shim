@@ -50,7 +50,7 @@ else
     echo "This will remove user patched timezones: $ZONEINFO_DIR"
 fi
 echo ""
-read -p "Are you sure you want to continue? [y/N] " -n 1 -r
+read -p "Are you sure you want to continue? [y/N] " -r
 echo ""
 
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
