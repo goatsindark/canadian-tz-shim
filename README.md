@@ -46,10 +46,10 @@ The installer will:
 ./install.sh
 ```
 
-This installs patched timezones to `~/.zoneinfo/` and requires setting the `TZ` environment variable:
+This installs patched timezones to `~/.tzinfo/` and requires setting the `TZ` environment variable:
 
 ```bash
-export TZ=~/.zoneinfo/America/Vancouver
+export TZ=~/.tzinfo/America/Vancouver
 ```
 
 Add this to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) for persistence.

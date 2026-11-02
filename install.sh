@@ -15,7 +15,7 @@ if [[ $EUID -eq 0 ]]; then
     STATE_DIR="/var/lib/canadian-tz-shim"
 else
     # Running as user: install to home directory
-    ZONEINFO_DIR="${HOME}/.zoneinfo"
+    ZONEINFO_DIR="${HOME}/.tzinfo"
     SYSTEM_WIDE=false
     STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
 fi
@@ -87,45 +87,111 @@ detect_current_timezone() {
 }
 
 # Show menu for timezone selection
+# Display goes to /dev/tty (visible to user), return value goes to stdout
 show_timezone_menu() {
     local zones=()
     local names=()
-    
+
     while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
         [[ "$iana_zone" =~ ^#.*$ ]] && continue
         [[ -z "$iana_zone" ]] && continue
         zones+=("$iana_zone")
         names+=("$official_name ($official_abbrev)")
     done < "$CONFIG_FILE"
-    
-    echo ""
-    echo "Select your timezone:"
-    echo ""
+
+    # All display output goes to /dev/tty so it's not captured by $()
+    echo "" >&2
+    echo "Select your timezone:" >&2
+    echo "" >&2
     for i in "${!zones[@]}"; do
-        echo "  $((i+1))) ${zones[$i]} - ${names[$i]}"
+        echo "  $((i+1))) ${zones[$i]} - ${names[$i]}" >&2
     done
-    echo ""
-    read -p "Enter choice [1-${#zones[@]}]: " choice
-    
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#zones[@]} ]]; then
-        echo "${zones[$((choice-1))]}"
-    else
-        error "Invalid choice"
-        return 1
-    fi
+    echo "" >&2
+
+    local choice=""
+    while true; do
+        read -r -p "Enter choice [1-${#zones[@]}]: " choice </dev/tty >&2
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#zones[@]} ]]; then
+            # Only the selection goes to stdout for capture
+            echo "${zones[$((choice-1))]}"
+            return 0
+        fi
+        echo "Invalid choice. Please enter a number between 1 and ${#zones[@]}." >&2
+    done
 }
 
-# Determine which zone to activate
+# Validate that a timezone identifier is in our config
+validate_zone() {
+    local zone="$1"
+    while IFS='|' read -r iana_zone _rest; do
+        [[ "$iana_zone" =~ ^#.*$ ]] && continue
+        [[ -z "$iana_zone" ]] && continue
+        if [[ "$iana_zone" == "$zone" ]]; then
+            return 0
+        fi
+    done < "$CONFIG_FILE"
+    return 1
+}
+
+# Targeted binary patcher: patches only TZif abbreviation pools and POSIX footer
+# This is safer than global sed because it only modifies known abbreviation locations
+patch_tzif_file() {
+    local file="$1"
+    local old_abbrev="$2"
+    local new_abbrev="$3"
+
+    # Both must be exactly 3 bytes for safe replacement
+    if [[ ${#old_abbrev} -ne 3 ]] || [[ ${#new_abbrev} -ne 3 ]]; then
+        error "Abbreviations must be exactly 3 characters"
+        return 1
+    fi
+
+    # Use the external Python patcher script
+    local patcher_script="${SCRIPT_DIR}/lib/patch_tzif.py"
+    if [[ ! -f "$patcher_script" ]]; then
+        error "Patcher script not found: $patcher_script"
+        return 1
+    fi
+
+    python3 "$patcher_script" "$file" "$old_abbrev" "$new_abbrev" 2>/dev/null
+}
+
+# Verify a patched TZif file is structurally sound
+verify_tzif_integrity() {
+    local patched_file="$1"
+    local original_file="$2"
+
+    # Check file sizes match (equal-length replacement preserves size)
+    local patched_size original_size
+    patched_size=$(stat -c%s "$patched_file")
+    original_size=$(stat -c%s "$original_file")
+
+    if [[ "$patched_size" != "$original_size" ]]; then
+        error "File size changed: $original_size → $patched_size"
+        return 1
+    fi
+
+    # Use zdump to verify the file is still a valid timezone file
+    if ! zdump -v "$patched_file" &>/dev/null; then
+        error "zdump cannot parse patched file"
+        return 1
+    fi
+
+    return 0
+}
+
+# Determine which zone to activate (system-wide only)
 selected_zone=""
+original_timezone=""
 if [[ "$SYSTEM_WIDE" == "true" ]]; then
     current_tz=$(detect_current_timezone || echo "")
-    
+
     # Check if current timezone matches one of our zones
     matched=false
     while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
         [[ "$iana_zone" =~ ^#.*$ ]] && continue
         [[ -z "$iana_zone" ]] && continue
-        
+
         if [[ "$current_tz" == "$iana_zone" ]]; then
             selected_zone="$iana_zone"
             matched=true
@@ -133,7 +199,7 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
             break
         fi
     done < "$CONFIG_FILE"
-    
+
     # If no match, show menu
     if [[ "$matched" == "false" ]]; then
         if [[ -n "$current_tz" ]]; then
@@ -142,7 +208,16 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
             warn "Could not detect current timezone."
         fi
         selected_zone=$(show_timezone_menu) || exit 1
+
+        # Validate the selection
+        if ! validate_zone "$selected_zone"; then
+            error "Invalid timezone selection: $selected_zone"
+            exit 1
+        fi
     fi
+
+    # Save the original timezone for restoration during uninstall
+    original_timezone="$current_tz"
 fi
 
 # Read configuration and process each zone
@@ -154,21 +229,21 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
     # Skip comments and empty lines
     [[ "$iana_zone" =~ ^#.*$ ]] && continue
     [[ -z "$iana_zone" ]] && continue
-    
+
     system_zone="/usr/share/zoneinfo/${iana_zone}"
     target_zone="${ZONEINFO_DIR}/${iana_zone}"
     target_dir="$(dirname "$target_zone")"
-    
+
     # Print initial status line
     echo -en "${BLUE}Processing:${NC} $iana_zone ($official_name) ... "
-    
+
     # Check if system zoneinfo file exists
     if [[ ! -f "$system_zone" ]]; then
         echo -e "${YELLOW}SKIP${NC} (zone file not found)"
         skipped_count=$((skipped_count + 1))
         continue
     fi
-    
+
     # Idempotency check: if already patched, skip
     if [[ -f "$target_zone" ]]; then
         # Check if the official abbreviation is already present in recent dates
@@ -176,7 +251,7 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
             verify_year="2020"
         fi
-        
+
         # Capture zdump output to avoid pipe buffering issues
         zdump_output=$(zdump -v "$target_zone" 2>/dev/null)
         if echo "$zdump_output" | grep -q "$verify_year.*$official_abbrev"; then
@@ -184,42 +259,48 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
             skipped_count=$((skipped_count + 1))
             continue
         fi
-        
+
         # Backup existing file before overwriting
         cp "$target_zone" "${target_zone}.backup.$(date +%s)"
     fi
-    
+
     # Create directory structure
     mkdir -p "$target_dir"
-    
+
     # Copy system zoneinfo file
     cp "$system_zone" "$target_zone"
-    
-    # Patch the file: replace IANA abbreviation with official abbreviation
-    if sed -i "s/$iana_abbrev/$official_abbrev/g" "$target_zone"; then
-        # Verify the patch - check if the official abbreviation appears in recent dates
-        # Different zones have different transition years
-        verify_year="2026"
-        if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
-            verify_year="2020"
-        fi
-        
-        # Get zdump output and verify
-        zdump_output=$(zdump -v "$target_zone")
-        pattern="$verify_year.*$official_abbrev"
-        
-        if echo "$zdump_output" | grep -q "$pattern"; then
-            echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev"
-            patched_count=$((patched_count + 1))
+
+    # Patch the file using targeted binary patching
+    patch_count=$(patch_tzif_file "$target_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
+
+    if [[ "$patch_count" -gt 0 ]]; then
+        # Verify structural integrity
+        if verify_tzif_integrity "$target_zone" "$system_zone"; then
+            # Verify the abbreviation appears in recent dates
+            verify_year="2026"
+            if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
+                verify_year="2020"
+            fi
+
+            zdump_output=$(zdump -v "$target_zone")
+            pattern="$verify_year.*$official_abbrev"
+
+            if echo "$zdump_output" | grep -q "$pattern"; then
+                echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev ($patch_count locations)"
+                patched_count=$((patched_count + 1))
+            else
+                echo -e "${RED}✗${NC} verification failed"
+                error_count=$((error_count + 1))
+            fi
         else
-            echo -e "${RED}✗${NC} verification failed"
+            echo -e "${RED}✗${NC} integrity check failed"
             error_count=$((error_count + 1))
         fi
     else
-        echo -e "${RED}✗${NC} patch failed"
+        echo -e "${RED}✗${NC} no locations patched"
         error_count=$((error_count + 1))
     fi
-    
+
 done < "$CONFIG_FILE"
 
 # Summary
@@ -237,44 +318,63 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
         info "All zones are already patched. No changes needed."
     fi
     echo ""
-    
+
     if [[ "$SYSTEM_WIDE" == "true" ]]; then
         # Store selected zone for systemd service
         mkdir -p "$STATE_DIR"
         echo "$selected_zone" > "${STATE_DIR}/selected-zone"
-        
+
+        # Save original timezone to /etc/tzshim.conf for restoration during uninstall
+        if [[ -n "$original_timezone" ]]; then
+            echo "original_timezone=$original_timezone" > /etc/tzshim.conf
+            info "Saved original timezone to /etc/tzshim.conf: $original_timezone"
+        else
+            # If we couldn't detect the original, save the current /etc/localtime target
+            if [[ -L /etc/localtime ]]; then
+                current_link=$(readlink -f /etc/localtime)
+                echo "original_timezone_path=$current_link" > /etc/tzshim.conf
+                info "Saved original /etc/localtime target to /etc/tzshim.conf: $current_link"
+            fi
+        fi
+
         # Create symlink to /etc/localtime
         target_zone="${ZONEINFO_DIR}/${selected_zone}"
         if [[ -f "$target_zone" ]]; then
             ln -sf "$target_zone" /etc/localtime
             info "Updated /etc/localtime → $selected_zone"
         fi
-        
+
         # Install systemd service
         if command -v systemctl &>/dev/null; then
             mkdir -p /usr/local/libexec/canadian-tz-shim
             cp "${SCRIPT_DIR}/lib/reapply.sh" /usr/local/libexec/canadian-tz-shim/
             chmod +x /usr/local/libexec/canadian-tz-shim/reapply.sh
-            
+
+            # Copy the patch helper if it exists as a standalone script
+            if [[ -f "${SCRIPT_DIR}/lib/patch_tzif.py" ]]; then
+                cp "${SCRIPT_DIR}/lib/patch_tzif.py" /usr/local/libexec/canadian-tz-shim/
+                chmod +x /usr/local/libexec/canadian-tz-shim/patch_tzif.py
+            fi
+
             mkdir -p /usr/local/share/canadian-tz-shim
             cp "${SCRIPT_DIR}/zones.conf" /usr/local/share/canadian-tz-shim/
-            
+
             cp "${SCRIPT_DIR}/lib/canadian-tz-shim.service" /etc/systemd/system/
             cp "${SCRIPT_DIR}/lib/canadian-tz-shim.path" /etc/systemd/system/
-            
+
             systemctl daemon-reload
             systemctl enable canadian-tz-shim.path
             systemctl start canadian-tz-shim.path
-            
+
             info "Installed systemd service to watch for tzdata updates"
         fi
-        
+
         echo ""
         echo "The shim is now active system-wide. Changes take effect immediately."
         echo ""
         echo "To verify:"
         echo "  date +'%Z %z'"
-        
+
         # Extract official abbreviation for selected zone
         while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
             [[ "$iana_zone" =~ ^#.*$ ]] && continue
@@ -285,6 +385,21 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
             fi
         done < "$CONFIG_FILE"
     else
+        # Save original timezone to ~/.config/tzshim.conf for restoration during uninstall
+        current_tz=$(detect_current_timezone || echo "")
+        mkdir -p "${HOME}/.config"
+        if [[ -n "$current_tz" ]]; then
+            echo "original_timezone=$current_tz" > "${HOME}/.config/tzshim.conf"
+            info "Saved original timezone to ~/.config/tzshim.conf: $current_tz"
+        else
+            # If we couldn't detect the original, save the current /etc/localtime target
+            if [[ -L /etc/localtime ]]; then
+                current_link=$(readlink -f /etc/localtime)
+                echo "original_timezone_path=$current_link" > "${HOME}/.config/tzshim.conf"
+                info "Saved original /etc/localtime target to ~/.config/tzshim.conf: $current_link"
+            fi
+        fi
+
         echo "To use the patched timezones, set TZ to the patched zone path:"
         echo ""
         echo "  # For Vancouver (Pacific Time):"
@@ -307,7 +422,7 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
         echo "For system-wide installation with automatic updates, run this script as root:"
         echo "  sudo $0"
     fi
-    
+
     echo ""
     echo "To uninstall, run: ./uninstall.sh"
 else

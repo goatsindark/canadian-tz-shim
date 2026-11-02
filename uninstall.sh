@@ -10,7 +10,7 @@ if [[ $EUID -eq 0 ]]; then
     STATE_DIR="/var/lib/canadian-tz-shim"
     SYSTEM_WIDE=true
 else
-    ZONEINFO_DIR="${HOME}/.zoneinfo"
+    ZONEINFO_DIR="${HOME}/.tzinfo"
     STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
     SYSTEM_WIDE=false
 fi
@@ -90,11 +90,47 @@ fi
 
 # Restore /etc/localtime if system-wide
 if [[ "$SYSTEM_WIDE" == "true" ]]; then
-    # Try to restore to original system timezone
-    if [[ -f /usr/share/zoneinfo/America/Vancouver ]]; then
-        # Check if we can detect the original timezone from backup or system
-        info "Restoring /etc/localtime to system default..."
-        ln -sf /usr/share/zoneinfo/America/Vancouver /etc/localtime
+    # Read original timezone from /etc/tzshim.conf
+    if [[ -f /etc/tzshim.conf ]]; then
+        # Source the config file to get variables
+        source /etc/tzshim.conf
+
+        if [[ -n "${original_timezone:-}" ]]; then
+            # Restore to the original timezone name
+            if [[ -f "/usr/share/zoneinfo/$original_timezone" ]]; then
+                info "Restoring /etc/localtime to original timezone: $original_timezone"
+                ln -sf "/usr/share/zoneinfo/$original_timezone" /etc/localtime
+            else
+                warn "Original timezone file not found: /usr/share/zoneinfo/$original_timezone"
+                warn "/etc/localtime not restored"
+            fi
+        elif [[ -n "${original_timezone_path:-}" ]]; then
+            # Restore to the original path
+            if [[ -f "$original_timezone_path" ]]; then
+                info "Restoring /etc/localtime to original path: $original_timezone_path"
+                ln -sf "$original_timezone_path" /etc/localtime
+            else
+                warn "Original timezone file not found: $original_timezone_path"
+                warn "/etc/localtime not restored"
+            fi
+        else
+            warn "No original timezone information found in /etc/tzshim.conf"
+            warn "/etc/localtime not restored"
+        fi
+
+        # Remove the config file
+        rm -f /etc/tzshim.conf
+        info "Removed /etc/tzshim.conf"
+    else
+        warn "/etc/tzshim.conf not found"
+        warn "Cannot determine original timezone"
+        warn "/etc/localtime not restored"
+    fi
+else
+    # User mode: clean up ~/.config/tzshim.conf if it exists
+    if [[ -f "${HOME}/.config/tzshim.conf" ]]; then
+        rm -f "${HOME}/.config/tzshim.conf"
+        info "Removed ~/.config/tzshim.conf"
     fi
 fi
 
@@ -110,6 +146,6 @@ echo ""
 if [[ "$SYSTEM_WIDE" == "false" ]]; then
     echo "Remember to remove the TZ export from your shell profile if you added it:"
     echo ""
-    echo "    export TZ=\$HOME/.zoneinfo/America/Vancouver"
+    echo "    export TZ=\$HOME/.tzinfo/America/Vancouver"
     echo ""
 fi

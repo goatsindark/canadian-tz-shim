@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
-# Canadian Timezone Shim - Test script
-# Verifies all patched timezones work correctly
+# Canadian Timezone Shim - Comprehensive Test Suite
+# Tests installation, functionality, reapplication, and uninstallation
 
 set -euo pipefail
 
-ZONEINFO_DIR="${HOME}/.zoneinfo"
-CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/zones.conf"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/zones.conf"
+
+# Determine test mode based on arguments or environment
+if [[ "${1:-}" == "--system" ]] || [[ $EUID -eq 0 ]]; then
+    TEST_MODE="system"
+    ZONEINFO_DIR="/usr/local/share/zoneinfo"
+    STATE_DIR="/var/lib/canadian-tz-shim"
+    CONFIG_PATH="/etc/tzshim.conf"
+else
+    TEST_MODE="user"
+    ZONEINFO_DIR="${HOME}/.tzinfo"
+    STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
+    CONFIG_PATH="${HOME}/.config/tzshim.conf"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -36,15 +49,66 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     fail "Configuration file not found: $CONFIG_FILE"
 fi
 
-header "Canadian Timezone Shim Test Suite"
+header "Canadian Timezone Shim Test Suite ($TEST_MODE mode)"
 echo ""
 
 total_tests=0
 passed_tests=0
 
-# Read configuration and test each zone
+# Test 1: Verify installation
+header "Test Group 1: Installation Verification"
+info "Test: Patched timezone files exist"
+all_exist=true
 while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
-    # Skip comments and empty lines
+    [[ "$iana_zone" =~ ^#.*$ ]] && continue
+    [[ -z "$iana_zone" ]] && continue
+    
+    patched_zone="${ZONEINFO_DIR}/${iana_zone}"
+    if [[ ! -f "$patched_zone" ]]; then
+        fail "Patched timezone not found: $patched_zone"
+        fail "Please run ./install.sh first."
+    fi
+done < "$CONFIG_FILE"
+total_tests=$((total_tests + 1))
+passed_tests=$((passed_tests + 1))
+pass "All patched timezone files exist"
+echo ""
+
+# Test 2: Verify state files
+header "Test Group 2: State File Verification"
+if [[ "$TEST_MODE" == "system" ]]; then
+    info "Test: System state files exist"
+    if [[ -f "${STATE_DIR}/selected-zone" ]]; then
+        total_tests=$((total_tests + 1))
+        passed_tests=$((passed_tests + 1))
+        pass "Selected zone state file exists"
+    else
+        fail "Selected zone state file not found: ${STATE_DIR}/selected-zone"
+    fi
+    
+    info "Test: Config file exists"
+    if [[ -f "$CONFIG_PATH" ]]; then
+        total_tests=$((total_tests + 1))
+        passed_tests=$((passed_tests + 1))
+        pass "Config file exists at $CONFIG_PATH"
+    else
+        fail "Config file not found: $CONFIG_PATH"
+    fi
+else
+    info "Test: User config file exists"
+    if [[ -f "$CONFIG_PATH" ]]; then
+        total_tests=$((total_tests + 1))
+        passed_tests=$((passed_tests + 1))
+        pass "User config file exists at $CONFIG_PATH"
+    else
+        fail "User config file not found: $CONFIG_PATH"
+    fi
+fi
+echo ""
+
+# Test 3: Verify timezone abbreviations for all zones
+header "Test Group 3: Timezone Abbreviation Tests"
+while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
     [[ "$iana_zone" =~ ^#.*$ ]] && continue
     [[ -z "$iana_zone" ]] && continue
     
@@ -52,81 +116,76 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
     
     header "Testing: $iana_zone ($official_name)"
     
-    # Check if patched timezone exists
-    if [[ ! -f "$patched_zone" ]]; then
-        fail "Patched timezone not found: $patched_zone"
-        fail "Please run ./install.sh first."
+    # Test: Date after transition should show official abbreviation
+    total_tests=$((total_tests + 1))
+    info "Test: Date after transition should show $official_abbrev"
+    
+    # Determine transition date
+    if [[ "$iana_zone" == "America/Whitehorse" || "$iana_zone" == "America/Dawson" ]]; then
+        transition_date="2020-11-01"
+        pre_transition_date="2019-01-15"
+        pre_transition_summer="2019-07-15"
+    else
+        transition_date="2026-11-01"
+        pre_transition_date="2025-01-15"
+        pre_transition_summer="2025-07-15"
     fi
     
-    # Test 1: Date after November 1, 2026 should show official abbreviation
-    total_tests=$((total_tests + 1))
-    info "Test $total_tests: Date after Nov 1, 2026 should show $official_abbrev"
-    result=$(TZ="$patched_zone" date -d "2026-12-15" +"%Z")
+    result=$(TZ="$patched_zone" date -d "$transition_date 12:00:00" +"%Z")
     if [[ "$result" == "$official_abbrev" ]]; then
-        pass "2026-12-15 shows $official_abbrev"
+        pass "$transition_date shows $official_abbrev"
         passed_tests=$((passed_tests + 1))
     else
-        fail "2026-12-15 shows $result (expected $official_abbrev)"
+        fail "$transition_date shows $result (expected $official_abbrev)"
     fi
     
-    # Test 2: Date before November 1, 2026 (winter) should show standard abbreviation
+    # Test: Date before transition (winter) should show old standard abbreviation
     total_tests=$((total_tests + 1))
-    info "Test $total_tests: Date before Nov 1, 2026 (winter) should show standard abbreviation"
-    result=$(TZ="$patched_zone" date -d "2025-01-15" +"%Z")
-    # For zones that changed in 2026, winter 2025 should show the old standard time
-    # For Yukon (changed in 2020), winter 2019 should show old standard time
-    if [[ "$iana_zone" == "America/Whitehorse" || "$iana_zone" == "America/Dawson" ]]; then
-        # Yukon changed in 2020, so test 2019
-        result=$(TZ="$patched_zone" date -d "2019-01-15" +"%Z")
-        if [[ "$result" == "PST" ]]; then
-            pass "2019-01-15 shows PST (pre-Yukon change)"
-            passed_tests=$((passed_tests + 1))
-        else
-            fail "2019-01-15 shows $result (expected PST)"
-        fi
+    info "Test: Date before transition (winter) should show old standard abbreviation"
+    result=$(TZ="$patched_zone" date -d "$pre_transition_date" +"%Z")
+    
+    # Determine expected old abbreviation
+    case "$iana_zone" in
+        America/Vancouver) expected_old="PST" ;;
+        America/Edmonton) expected_old="MST" ;;
+        America/Yellowknife) expected_old="MST" ;;
+        America/Winnipeg) expected_old="CST" ;;
+        America/Whitehorse|America/Dawson) expected_old="PST" ;;
+    esac
+    
+    if [[ "$result" == "$expected_old" ]]; then
+        pass "$pre_transition_date shows $result (pre-transition standard time)"
+        passed_tests=$((passed_tests + 1))
     else
-        # Other zones changed in 2026
-        if [[ "$iana_zone" == "America/Vancouver" && "$result" == "PST" ]] || \
-           [[ "$iana_zone" == "America/Edmonton" && "$result" == "MST" ]] || \
-           [[ "$iana_zone" == "America/Yellowknife" && "$result" == "MST" ]] || \
-           [[ "$iana_zone" == "America/Winnipeg" && "$result" == "CST" ]]; then
-            pass "2025-01-15 shows $result (pre-change standard time)"
-            passed_tests=$((passed_tests + 1))
-        else
-            fail "2025-01-15 shows $result (unexpected)"
-        fi
+        fail "$pre_transition_date shows $result (expected $expected_old)"
     fi
     
-    # Test 3: Date before November 1, 2026 (summer) should show daylight abbreviation
+    # Test: Date before transition (summer) should show old daylight abbreviation
     total_tests=$((total_tests + 1))
-    info "Test $total_tests: Date before Nov 1, 2026 (summer) should show daylight abbreviation"
-    if [[ "$iana_zone" == "America/Whitehorse" || "$iana_zone" == "America/Dawson" ]]; then
-        # Yukon changed in 2020, so test 2019 summer
-        result=$(TZ="$patched_zone" date -d "2019-07-15" +"%Z")
-        if [[ "$result" == "PDT" ]]; then
-            pass "2019-07-15 shows PDT (pre-Yukon change)"
-            passed_tests=$((passed_tests + 1))
-        else
-            fail "2019-07-15 shows $result (expected PDT)"
-        fi
+    info "Test: Date before transition (summer) should show old daylight abbreviation"
+    result=$(TZ="$patched_zone" date -d "$pre_transition_summer" +"%Z")
+    
+    # Determine expected old daylight abbreviation
+    case "$iana_zone" in
+        America/Vancouver) expected_old_daylight="PDT" ;;
+        America/Edmonton) expected_old_daylight="MDT" ;;
+        America/Yellowknife) expected_old_daylight="MDT" ;;
+        America/Winnipeg) expected_old_daylight="CDT" ;;
+        America/Whitehorse|America/Dawson) expected_old_daylight="PDT" ;;
+    esac
+    
+    if [[ "$result" == "$expected_old_daylight" ]]; then
+        pass "$pre_transition_summer shows $result (pre-transition daylight time)"
+        passed_tests=$((passed_tests + 1))
     else
-        result=$(TZ="$patched_zone" date -d "2025-07-15" +"%Z")
-        if [[ "$iana_zone" == "America/Vancouver" && "$result" == "PDT" ]] || \
-           [[ "$iana_zone" == "America/Edmonton" && "$result" == "MDT" ]] || \
-           [[ "$iana_zone" == "America/Yellowknife" && "$result" == "MDT" ]] || \
-           [[ "$iana_zone" == "America/Winnipeg" && "$result" == "CDT" ]]; then
-            pass "2025-07-15 shows $result (pre-change daylight time)"
-            passed_tests=$((passed_tests + 1))
-        else
-            fail "2025-07-15 shows $result (unexpected)"
-        fi
+        fail "$pre_transition_summer shows $result (expected $expected_old_daylight)"
     fi
     
-    # Test 4: Offset should be correct for official abbreviation
+    # Test: UTC offset should be correct
     total_tests=$((total_tests + 1))
-    info "Test $total_tests: Offset should be correct for $official_abbrev"
-    result=$(TZ="$patched_zone" date -d "2026-12-15" +"%z")
-    expected_offset=""
+    info "Test: UTC offset should be correct for $official_abbrev"
+    result=$(TZ="$patched_zone" date -d "$transition_date 12:00:00" +"%z")
+    
     case "$official_abbrev" in
         PCT) expected_offset="-0700" ;;
         ABT) expected_offset="-0600" ;;
@@ -134,38 +193,83 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         MBT) expected_offset="-0500" ;;
         NWT) expected_offset="-0600" ;;
     esac
+    
     if [[ "$result" == "$expected_offset" ]]; then
-        pass "2026-12-15 offset is $result"
+        pass "$transition_date offset is $result"
         passed_tests=$((passed_tests + 1))
     else
-        fail "2026-12-15 offset is $result (expected $expected_offset)"
+        fail "$transition_date offset is $result (expected $expected_offset)"
     fi
     
-    # Test 5: Transition date should show official abbreviation
+    # Test: Future date (year 2100) should show official abbreviation
     total_tests=$((total_tests + 1))
-    info "Test $total_tests: Transition date should show $official_abbrev"
-    if [[ "$iana_zone" == "America/Whitehorse" || "$iana_zone" == "America/Dawson" ]]; then
-        # Yukon transition was Nov 1, 2020
-        result=$(TZ="$patched_zone" date -d "2020-11-01 12:00:00" +"%Z")
-        if [[ "$result" == "$official_abbrev" ]]; then
-            pass "2020-11-01 shows $official_abbrev"
-            passed_tests=$((passed_tests + 1))
-        else
-            fail "2020-11-01 shows $result (expected $official_abbrev)"
-        fi
+    info "Test: Future date (2100) should show $official_abbrev"
+    result=$(TZ="$patched_zone" date -d "2100-06-15 12:00:00" +"%Z")
+    if [[ "$result" == "$official_abbrev" ]]; then
+        pass "2100-06-15 shows $official_abbrev"
+        passed_tests=$((passed_tests + 1))
     else
-        # Other zones transitioned Nov 1, 2026
-        result=$(TZ="$patched_zone" date -d "2026-11-01 12:00:00" +"%Z")
-        if [[ "$result" == "$official_abbrev" ]]; then
-            pass "2026-11-01 shows $official_abbrev"
-            passed_tests=$((passed_tests + 1))
-        else
-            fail "2026-11-01 shows $result (expected $official_abbrev)"
-        fi
+        fail "2100-06-15 shows $result (expected $official_abbrev)"
     fi
     
     echo ""
 done < "$CONFIG_FILE"
+
+# Test 4: Reapplication test (system mode only)
+if [[ "$TEST_MODE" == "system" ]]; then
+    header "Test Group 4: Reapplication Test"
+    if [[ -x "${SCRIPT_DIR}/lib/reapply.sh" ]]; then
+        info "Test: Reapply script exists and is executable"
+        total_tests=$((total_tests + 1))
+        passed_tests=$((passed_tests + 1))
+        pass "Reapply script exists and is executable"
+        
+        info "Test: Running reapply script"
+        if sudo "${SCRIPT_DIR}/lib/reapply.sh" 2>&1 | grep -q "Re-patched"; then
+            total_tests=$((total_tests + 1))
+            passed_tests=$((passed_tests + 1))
+            pass "Reapply script executed successfully"
+        else
+            total_tests=$((total_tests + 1))
+            fail "Reapply script did not produce expected output"
+        fi
+    else
+        info "Test: Reapply script not found or not executable (skipped)"
+    fi
+    echo ""
+fi
+
+# Test 5: Idempotency test
+header "Test Group 5: Idempotency Test"
+info "Test: Running install.sh again should skip already-patched zones"
+output=$(bash "${SCRIPT_DIR}/install.sh" 2>&1 || true)
+if echo "$output" | grep -q "SKIP.*already patched"; then
+    total_tests=$((total_tests + 1))
+    passed_tests=$((passed_tests + 1))
+    pass "Install script correctly detects already-patched zones"
+else
+    total_tests=$((total_tests + 1))
+    fail "Install script did not detect already-patched zones"
+fi
+echo ""
+
+# Test 6: Config file preservation test
+header "Test Group 6: Config File Preservation Test"
+info "Test: Config file contains original timezone information"
+if [[ -f "$CONFIG_PATH" ]]; then
+    if grep -q "original_timezone" "$CONFIG_PATH"; then
+        total_tests=$((total_tests + 1))
+        passed_tests=$((passed_tests + 1))
+        pass "Config file contains original timezone information"
+    else
+        total_tests=$((total_tests + 1))
+        fail "Config file does not contain original timezone information"
+    fi
+else
+    total_tests=$((total_tests + 1))
+    fail "Config file not found"
+fi
+echo ""
 
 # Summary
 header "Test Summary"
@@ -180,6 +284,10 @@ if [[ $passed_tests -eq $total_tests ]]; then
     echo ""
     echo "All Canadian timezone patches are working correctly."
     echo "Historical timezone transitions are preserved."
+    echo "Future dates work correctly."
+    if [[ "$TEST_MODE" == "system" ]]; then
+        echo "Reapplication and idempotency work correctly."
+    fi
     exit 0
 else
     fail "Some tests failed. Please review the output above."
