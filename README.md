@@ -20,9 +20,12 @@ This tool patches your local timezone files to use the official abbreviations wh
 - **Menu selection** - Prompts for timezone selection when detection is ambiguous
 - **Automatic symlink management** - Updates `/etc/localtime` to point to patched timezone
 - **Systemd service** - Automatically re-applies patches when tzdata package updates
-- **Idempotent installation** - Safe to run multiple times
+- **Version-aware upgrades** - Safely upgrade between versions with automatic rollback
+- **Idempotent installation** - Safe to run multiple times, preserves original timezone metadata
 - **System-wide or user-level** - Install for all users or just your account
 - **Complete coverage** - All 6 Canadian zones that diverged from IANA
+- **Safe uninstallation** - Only removes files created by the shim, preserves unrelated files
+- **Partial installation protection** - Only activates successfully patched zones
 
 ## Installation
 
@@ -54,22 +57,75 @@ export TZ=~/.tzinfo/America/Vancouver
 
 Add this to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) for persistence.
 
+## Upgrading
+
+The shim includes a version-aware upgrade system that safely migrates installations between versions.
+
+### Checking for Upgrades
+
+```bash
+# Check if upgrade is available (dry run)
+./install.sh --upgrade --dry-run
+```
+
+This will show:
+- Current installed version
+- Available upgrade path
+- Planned migration operations
+- Any blockers or issues
+
+### Performing an Upgrade
+
+```bash
+# Upgrade to latest version
+./install.sh --upgrade
+
+# For system-wide installation
+sudo ./install.sh --upgrade
+```
+
+The upgrade process will:
+1. Detect current installation state
+2. Validate upgrade path
+3. Create backup for rollback
+4. Execute migration operations
+5. Validate result
+6. Update version metadata
+
+### Upgrade Safety
+
+The upgrade system includes multiple safety features:
+
+- **Automatic rollback** on failure
+- **Metadata preservation** (original timezone, user selections)
+- **Concurrent operation protection** via locking
+- **Validation** before and after migration
+- **Legacy support** for older versions without version tracking
+
+See [UPGRADE_SYSTEM.md](UPGRADE_SYSTEM.md) for detailed documentation.
+
 ## How It Works
 
-### Binary Patching
+### TZif-Aware Binary Patching
 
-The tool performs binary patching on compiled zoneinfo files:
+The tool uses a Python-based TZif-aware patcher that surgically modifies only the timezone abbreviation fields:
 
-1. Copies `/usr/share/zoneinfo/America/Vancouver` to the target location
-2. Searches for the IANA abbreviation (e.g., `MST`) in the binary data
-3. Replaces it with the official abbreviation (e.g., `PCT`)
-4. Both abbreviations are 3 bytes, so file size and offsets are preserved
+1. Parses the TZif binary structure to locate abbreviation pools
+2. Replaces the IANA abbreviation (e.g., `MST`) with the official abbreviation (e.g., `PCT`) in:
+   - v1 abbreviation pool (32-bit TZif)
+   - v2 abbreviation pool (64-bit TZif)
+   - POSIX footer string
+3. Validates file integrity after patching
+4. Verifies UTC offsets and transition rules
 
 This approach:
 - Preserves all historical timezone transitions (PST/PDT before Nov 2026, PCT after)
 - Maintains correct UTC offsets (UTC-7 year-round after the change)
 - Handles POSIX timezone strings at the end of the file
 - Works for all dates (past, present, and future)
+- Does not modify unrelated binary data
+
+**Important:** The TZif-aware patcher is the only supported patching method. There is no fallback to global string replacement.
 
 ### Automatic Updates
 
@@ -93,12 +149,18 @@ This ensures your patched timezone survives system updates without manual interv
 
 ### State Management
 
-The installer stores your timezone selection in a state file:
+The installer stores your timezone selection and original timezone metadata:
 
-- System-wide: `/var/lib/canadian-tz-shim/selected-zone`
-- User-level: `~/.local/state/canadian-tz-shim/selected-zone`
+- System-wide:
+  - Selected zone: `/var/lib/canadian-tz-shim/selected-zone`
+  - Original timezone: `/etc/tzshim.conf`
+- User-level:
+  - Selected zone: `~/.local/state/canadian-tz-shim/selected-zone`
+  - Original timezone: `~/.config/tzshim.conf`
 
-This allows the systemd service to know which timezone to re-apply after updates.
+This allows the systemd service to know which timezone to re-apply after updates, and enables clean uninstallation by restoring the original timezone.
+
+**Important:** The original timezone metadata is preserved across reinstallation. Running the installer multiple times will not overwrite the saved original timezone.
 
 ## Verification
 
@@ -132,9 +194,15 @@ sudo ./uninstall.sh
 This will:
 1. Stop and disable the systemd service
 2. Remove systemd service files
-3. Restore `/etc/localtime` to the original system timezone
-4. Remove patched timezone files
-5. Remove state directory
+3. Restore `/etc/localtime` to the original system timezone (saved during installation)
+4. Remove only the patched timezone files (preserves unrelated files)
+5. Remove state directory and configuration files
+
+**Safety features:**
+- Only removes files created by the shim
+- Preserves unrelated files in the same directories
+- Restores original timezone before removing files
+- If restoration fails, keeps timezone files to avoid breaking the system
 
 ### User-level
 
@@ -146,62 +214,101 @@ Remove the `TZ` export from your shell profile if you added it.
 
 ## Technical Details
 
-### Why Binary Patching?
+### Why TZif-Aware Patching?
 
-The alternative approach would be to modify the IANA tzdata source files and recompile with `zic`. However:
+The shim uses a Python-based TZif-aware patcher instead of simple string replacement because:
 
-- Requires `zic` and tzdata build toolchain
-- More complex installation process
-- Slower (compilation vs. instant binary patch)
-- Harder to maintain across tzdata versions
+- **Safety**: Only modifies known abbreviation locations in the TZif structure
+- **Correctness**: Validates file integrity and UTC offsets after patching
+- **Reliability**: No risk of corrupting unrelated binary data
+- **Maintainability**: Clear separation between patching logic and installation logic
 
-Binary patching is simpler and works reliably for same-length replacements.
+The alternative approach (global string replacement) could theoretically corrupt data if the abbreviation sequence appears elsewhere in the TZif structure. The TZif-aware patcher eliminates this risk.
 
 ### TZif Structure Awareness
 
-The global `sed` replacement isn't inherently aware of TZif structure. It replaces every occurrence of the 3-byte sequence, not just timezone abbreviations. In theory, this could corrupt data if the sequence appears elsewhere in the TZif structure.
+The patcher understands the TZif binary format and modifies only:
 
-In practice, for these specific timezone files:
-- The abbreviations are the only 3-letter uppercase sequences that match
-- The test suite validates dates across the full range (1900-2100+)
-- Transition timing is exact
+1. **v1 abbreviation pool** - 32-bit timezone data
+2. **v2 abbreviation pool** - 64-bit timezone data
+3. **POSIX footer string** - Future timezone rules
 
-The test suite provides confidence, though it doesn't establish correctness for every possible date.
+All other binary data (transition times, UTC offsets, DST rules) remains untouched. The patcher validates that:
 
-### Idempotency
+- File size is unchanged
+- File structure is valid
+- UTC offsets are correct
+- Abbreviations appear in the expected dates
 
-The installer is idempotent:
-- Checks if a timezone is already patched before re-patching
-- Skips zones that are already correct
-- Safe to run multiple times
-- Creates backups before overwriting existing patched files
+### Partial Installation Protection
+
+The installer tracks which zones were successfully patched and only activates those. If a zone fails to patch:
+
+- The failed zone file is removed
+- Other successfully patched zones remain active
+- The user is warned about the partial installation
+- No broken `/etc/localtime` references are created
+
+This ensures the system always has a working timezone configuration.
 
 ## Testing
 
-Run the component tests:
+Run the comprehensive test suite:
 
 ```bash
-./test-components.sh
+# Main test suite (installation, timezone correctness, safety)
+./test.sh
+
+# Upgrade system tests
+./test-upgrade.sh
+
+# Uninstall edge case tests
+./test-uninstall-edge-cases.sh
 ```
 
-Run the full test suite:
+For system-wide installation tests (requires root):
 
 ```bash
-./test.sh
+sudo ./test.sh --system
 ```
 
 The test suite validates:
-- Config file parsing (6 zones)
-- Systemd service file format
-- Systemd path file format
-- Reapply script permissions
-- Timezone detection logic
-- State directory creation
-- Patch idempotency
+
+### Installation Lifecycle
+- Initial installation and repeated installation
+- Preservation of original-timezone metadata across reinstalls
+- Idempotency (safe to run multiple times)
+- Partial installation protection
+
+### Upgrade System
+- Upgrade detection (current, upgradeable, legacy, corrupted, missing, not installed)
+- Dry run mode (no modifications)
+- Metadata preservation during upgrade
+- Version tracking after upgrade
+- Locking mechanism for concurrent operations
+- Unsupported upgrade path rejection
+- Downgrade rejection
+
+### Timezone Correctness
 - Historical timezone transitions (1900-2026)
 - Future timezone transitions (2026-2100+)
+- Exact transition boundaries (second-level precision)
 - POSIX timezone strings
-- Exact transition timing
+- UTC offset validation
+
+### Safety Features
+- Safe uninstallation (only removes shim files)
+- Original timezone restoration
+- Preservation of unrelated files
+- Failed patch cleanup
+- Legacy installation handling
+
+### System Integration (system mode only)
+- Systemd service reapplication
+- State file management
+- Configuration file preservation
+
+The test suite uses isolated temporary directories and does not modify the host's real `/etc/localtime` during automated tests.
 
 ## References
 

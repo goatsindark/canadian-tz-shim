@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Canadian Timezone Shim - Comprehensive Test Suite
-# Tests installation, functionality, reapplication, and uninstallation
+# Tests installation lifecycle, safety, and correctness
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/zones.conf"
 
-# Determine test mode based on arguments or environment
+# Test mode: user or system
 if [[ "${1:-}" == "--system" ]] || [[ $EUID -eq 0 ]]; then
     TEST_MODE="system"
     ZONEINFO_DIR="/usr/local/share/zoneinfo"
@@ -62,7 +62,7 @@ all_exist=true
 while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
     [[ "$iana_zone" =~ ^#.*$ ]] && continue
     [[ -z "$iana_zone" ]] && continue
-    
+
     patched_zone="${ZONEINFO_DIR}/${iana_zone}"
     if [[ ! -f "$patched_zone" ]]; then
         fail "Patched timezone not found: $patched_zone"
@@ -85,7 +85,7 @@ if [[ "$TEST_MODE" == "system" ]]; then
     else
         fail "Selected zone state file not found: ${STATE_DIR}/selected-zone"
     fi
-    
+
     info "Test: Config file exists"
     if [[ -f "$CONFIG_PATH" ]]; then
         total_tests=$((total_tests + 1))
@@ -111,15 +111,15 @@ header "Test Group 3: Timezone Abbreviation Tests"
 while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
     [[ "$iana_zone" =~ ^#.*$ ]] && continue
     [[ -z "$iana_zone" ]] && continue
-    
+
     patched_zone="${ZONEINFO_DIR}/${iana_zone}"
-    
+
     header "Testing: $iana_zone ($official_name)"
-    
+
     # Test: Date after transition should show official abbreviation
     total_tests=$((total_tests + 1))
     info "Test: Date after transition should show $official_abbrev"
-    
+
     # Determine transition date
     if [[ "$iana_zone" == "America/Whitehorse" || "$iana_zone" == "America/Dawson" ]]; then
         transition_date="2020-11-01"
@@ -130,7 +130,7 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         pre_transition_date="2025-01-15"
         pre_transition_summer="2025-07-15"
     fi
-    
+
     result=$(TZ="$patched_zone" date -d "$transition_date 12:00:00" +"%Z")
     if [[ "$result" == "$official_abbrev" ]]; then
         pass "$transition_date shows $official_abbrev"
@@ -138,12 +138,12 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
     else
         fail "$transition_date shows $result (expected $official_abbrev)"
     fi
-    
+
     # Test: Date before transition (winter) should show old standard abbreviation
     total_tests=$((total_tests + 1))
     info "Test: Date before transition (winter) should show old standard abbreviation"
     result=$(TZ="$patched_zone" date -d "$pre_transition_date" +"%Z")
-    
+
     # Determine expected old abbreviation
     case "$iana_zone" in
         America/Vancouver) expected_old="PST" ;;
@@ -152,19 +152,19 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         America/Winnipeg) expected_old="CST" ;;
         America/Whitehorse|America/Dawson) expected_old="PST" ;;
     esac
-    
+
     if [[ "$result" == "$expected_old" ]]; then
         pass "$pre_transition_date shows $result (pre-transition standard time)"
         passed_tests=$((passed_tests + 1))
     else
         fail "$pre_transition_date shows $result (expected $expected_old)"
     fi
-    
+
     # Test: Date before transition (summer) should show old daylight abbreviation
     total_tests=$((total_tests + 1))
     info "Test: Date before transition (summer) should show old daylight abbreviation"
     result=$(TZ="$patched_zone" date -d "$pre_transition_summer" +"%Z")
-    
+
     # Determine expected old daylight abbreviation
     case "$iana_zone" in
         America/Vancouver) expected_old_daylight="PDT" ;;
@@ -173,19 +173,19 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         America/Winnipeg) expected_old_daylight="CDT" ;;
         America/Whitehorse|America/Dawson) expected_old_daylight="PDT" ;;
     esac
-    
+
     if [[ "$result" == "$expected_old_daylight" ]]; then
         pass "$pre_transition_summer shows $result (pre-transition daylight time)"
         passed_tests=$((passed_tests + 1))
     else
         fail "$pre_transition_summer shows $result (expected $expected_old_daylight)"
     fi
-    
+
     # Test: UTC offset should be correct
     total_tests=$((total_tests + 1))
     info "Test: UTC offset should be correct for $official_abbrev"
     result=$(TZ="$patched_zone" date -d "$transition_date 12:00:00" +"%z")
-    
+
     case "$official_abbrev" in
         PCT) expected_offset="-0700" ;;
         ABT) expected_offset="-0600" ;;
@@ -193,14 +193,14 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         MBT) expected_offset="-0500" ;;
         NWT) expected_offset="-0600" ;;
     esac
-    
+
     if [[ "$result" == "$expected_offset" ]]; then
         pass "$transition_date offset is $result"
         passed_tests=$((passed_tests + 1))
     else
         fail "$transition_date offset is $result (expected $expected_offset)"
     fi
-    
+
     # Test: Future date (year 2100) should show official abbreviation
     total_tests=$((total_tests + 1))
     info "Test: Future date (2100) should show $official_abbrev"
@@ -211,7 +211,34 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
     else
         fail "2100-06-15 shows $result (expected $official_abbrev)"
     fi
-    
+
+    # Test: Exact transition boundary
+    total_tests=$((total_tests + 1))
+    info "Test: Exact transition boundary"
+    if [[ "$iana_zone" == "America/Whitehorse" || "$iana_zone" == "America/Dawson" ]]; then
+        before_transition=$(TZ="$patched_zone" date -d "2020-10-31 23:59:59" +"%Z")
+        after_transition=$(TZ="$patched_zone" date -d "2020-11-01 00:00:00" +"%Z")
+        if [[ "$before_transition" == "PDT" && "$after_transition" == "$official_abbrev" ]]; then
+            pass "Transition boundary correct"
+            passed_tests=$((passed_tests + 1))
+        else
+            fail "Transition boundary incorrect: before=$before_transition, after=$after_transition"
+        fi
+    else
+        before_transition=$(TZ="$patched_zone" date -d "2026-11-01 01:59:59" +"%Z")
+        after_transition=$(TZ="$patched_zone" date -d "2026-11-01 02:00:00" +"%Z")
+        if [[ "$before_transition" == "PDT" || "$before_transition" == "MDT" || "$before_transition" == "CDT" ]]; then
+            if [[ "$after_transition" == "$official_abbrev" ]]; then
+                pass "Transition boundary correct"
+                passed_tests=$((passed_tests + 1))
+            else
+                fail "Transition boundary incorrect: before=$before_transition, after=$after_transition"
+            fi
+        else
+            fail "Unexpected pre-transition abbreviation: $before_transition"
+        fi
+    fi
+
     echo ""
 done < "$CONFIG_FILE"
 
@@ -223,7 +250,7 @@ if [[ "$TEST_MODE" == "system" ]]; then
         total_tests=$((total_tests + 1))
         passed_tests=$((passed_tests + 1))
         pass "Reapply script exists and is executable"
-        
+
         info "Test: Running reapply script"
         if sudo "${SCRIPT_DIR}/lib/reapply.sh" 2>&1 | grep -q "Re-patched"; then
             total_tests=$((total_tests + 1))
@@ -271,6 +298,33 @@ else
 fi
 echo ""
 
+# Test 7: Reinstallation preserves original timezone
+header "Test Group 7: Reinstallation Metadata Preservation"
+if [[ -f "$CONFIG_PATH" ]]; then
+    original_value=$(grep "original_timezone" "$CONFIG_PATH" | cut -d= -f2)
+
+    info "Test: Reinstalling should preserve original timezone metadata"
+    bash "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1 || true
+
+    if [[ -f "$CONFIG_PATH" ]]; then
+        new_value=$(grep "original_timezone" "$CONFIG_PATH" | cut -d= -f2)
+        if [[ "$original_value" == "$new_value" ]]; then
+            total_tests=$((total_tests + 1))
+            passed_tests=$((passed_tests + 1))
+            pass "Original timezone metadata preserved across reinstallation"
+        else
+            total_tests=$((total_tests + 1))
+            fail "Original timezone metadata changed: $original_value → $new_value"
+        fi
+    else
+        total_tests=$((total_tests + 1))
+        fail "Config file disappeared after reinstallation"
+    fi
+else
+    info "Test: Skipped (no config file)"
+fi
+echo ""
+
 # Summary
 header "Test Summary"
 echo ""
@@ -285,8 +339,9 @@ if [[ $passed_tests -eq $total_tests ]]; then
     echo "All Canadian timezone patches are working correctly."
     echo "Historical timezone transitions are preserved."
     echo "Future dates work correctly."
+    echo "Installation lifecycle is safe and idempotent."
     if [[ "$TEST_MODE" == "system" ]]; then
-        echo "Reapplication and idempotency work correctly."
+        echo "Reapplication and metadata preservation work correctly."
     fi
     exit 0
 else

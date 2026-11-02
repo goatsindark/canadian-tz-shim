@@ -1,0 +1,184 @@
+{
+  "version": "1.0",
+  "current_release": "1.0.0",
+  "schema_version": "1",
+  "migrations": [
+    {
+      "from_version": "0.9.0",
+      "to_version": "1.0.0",
+      "description": "Initial release to version 1.0.0",
+      "schema_changes": [
+        {
+          "type": "add_field",
+          "file": "tzshim.conf",
+          "field": "schema_version",
+          "value": "1"
+        },
+        {
+          "type": "add_field",
+          "file": "tzshim.conf",
+          "field": "installed_version",
+          "value": "1.0.0"
+        }
+      ],
+      "file_changes": [
+        {
+          "type": "update_script",
+          "path": "lib/patch_tzif.py",
+          "action": "replace"
+        },
+        {
+          "type": "update_script",
+          "path": "lib/reapply.sh",
+          "action": "replace"
+        }
+      ],
+      "operations": [
+        {
+          "type": "backup_metadata",
+          "description": "Backup existing configuration"
+        },
+        {
+          "type": "update_scripts",
+          "description": "Update library scripts"
+        },
+        {
+          "type": "update_metadata",
+          "description": "Add version tracking to configuration"
+        },
+        {
+          "type": "validate_installation",
+          "description": "Verify all timezone files are valid"
+        }
+      ],
+      "validation": [
+        {
+          "type": "check_files",
+          "description": "Verify all timezone files exist"
+        },
+        {
+          "type": "check_abbreviations",
+          "description": "Verify abbreviations are correct"
+        },
+        {
+          "type": "check_offsets",
+          "description": "Verify UTC offsets are correct"
+        }
+      ],
+      "rollback": [
+        {
+          "type": "restore_metadata",
+          "description": "Restore backed up configuration"
+        },
+        {
+          "type": "restore_scripts",
+          "description": "Restore previous script versions"
+        }
+      ]
+    },
+    {
+      "from_version": "0.8.0",
+      "to_version": "1.0.0",
+      "description": "Legacy 0.8.x to version 1.0.0",
+      "schema_changes": [
+        {
+          "type": "add_field",
+          "file": "tzshim.conf",
+          "field": "schema_version",
+          "value": "1"
+        },
+        {
+          "type": "add_field",
+          "file": "tzshim.conf",
+          "field": "installed_version",
+          "value": "1.0.0"
+        },
+        {
+          "type": "migrate_field",
+          "file": "tzshim.conf",
+          "old_field": "original_tz",
+          "new_field": "original_timezone"
+        }
+      ],
+      "file_changes": [
+        {
+          "type": "update_script",
+          "path": "lib/patch_tzif.py",
+          "action": "replace"
+        },
+        {
+          "type": "update_script",
+          "path": "lib/reapply.sh",
+          "action": "replace"
+        },
+        {
+          "type": "add_file",
+          "path": "lib/canadian-tz-shim.service",
+          "action": "install"
+        },
+        {
+          "type": "add_file",
+          "path": "lib/canadian-tz-shim.path",
+          "action": "install"
+        }
+      ],
+      "operations": [
+        {
+          "type": "backup_metadata",
+          "description": "Backup existing configuration"
+        },
+        {
+          "type": "migrate_config",
+          "description": "Migrate configuration format"
+        },
+        {
+          "type": "update_scripts",
+          "description": "Update library scripts"
+        },
+        {
+          "type": "install_systemd",
+          "description": "Install systemd services"
+        },
+        {
+          "type": "validate_installation",
+          "description": "Verify all timezone files are valid"
+        }
+      ],
+      "validation": [
+        {
+          "type": "check_files",
+          "description": "Verify all timezone files exist"
+        },
+        {
+          "type": "check_abbreviations",
+          "description": "Verify abbreviations are correct"
+        },
+        {
+          "type": "check_offsets",
+          "description": "Verify UTC offsets are correct"
+        },
+        {
+          "type": "check_systemd",
+          "description": "Verify systemd services are installed"
+        }
+      ],
+      "rollback": [
+        {
+          "type": "restore_metadata",
+          "description": "Restore backed up configuration"
+        },
+        {
+          "type": "restore_scripts",
+          "description": "Restore previous script versions"
+        },
+        {
+          "type": "remove_systemd",
+          "description": "Remove systemd services"
+        }
+      ]
+    }
+  ],
+  "supported_versions": ["0.8.0", "0.9.0", "1.0.0"],
+  "minimum_version": "0.8.0",
+  "maximum_version": "1.0.0"
+}

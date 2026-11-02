@@ -21,6 +21,19 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
+# Require the Python patcher script
+if [[ ! -f "$PATCH_SCRIPT" ]]; then
+    logger -t canadian-tz-shim "ERROR: Patcher script not found: $PATCH_SCRIPT"
+    logger -t canadian-tz-shim "Cannot reapply without the TZif-aware patcher"
+    exit 1
+fi
+
+# Verify Python3 is available
+if ! command -v python3 &>/dev/null; then
+    logger -t canadian-tz-shim "ERROR: python3 not found, required for patching"
+    exit 1
+fi
+
 # Read selected zone from state file
 if [[ ! -f "$STATE_FILE" ]]; then
     logger -t canadian-tz-shim "No selected zone found, cannot reapply"
@@ -47,21 +60,43 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         continue
     fi
 
+    # Validate source timezone file
+    if ! zdump -v "$system_zone" &>/dev/null; then
+        logger -t canadian-tz-shim "Invalid source timezone file: $system_zone"
+        continue
+    fi
+
     # Copy fresh from system and patch
     cp "$system_zone" "$target_zone"
 
-    if [[ -f "$PATCH_SCRIPT" ]]; then
-        patch_count=$(python3 "$PATCH_SCRIPT" "$target_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
-    else
-        # Fallback to sed if patch script not available
-        sed -i "s/$iana_abbrev/$official_abbrev/g" "$target_zone"
-        patch_count=1
-    fi
+    # Use the required Python patcher
+    patch_count=$(python3 "$PATCH_SCRIPT" "$target_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
 
     if [[ "$patch_count" -gt 0 ]]; then
-        logger -t canadian-tz-shim "Re-patched $iana_zone ($iana_abbrev → $official_abbrev, $patch_count locations)"
+        # Verify the patch worked
+        verify_year="2026"
+        if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
+            verify_year="2020"
+        fi
+
+        zdump_output=$(zdump -v "$target_zone" 2>/dev/null)
+        if echo "$zdump_output" | grep -q "$verify_year.*$official_abbrev"; then
+            logger -t canadian-tz-shim "Re-patched $iana_zone ($iana_abbrev → $official_abbrev, $patch_count locations)"
+        else
+            logger -t canadian-tz-shim "Failed to verify patch for $iana_zone"
+            # Restore from backup if available
+            if [[ -f "${target_zone}.backup" ]]; then
+                cp "${target_zone}.backup" "$target_zone"
+                logger -t canadian-tz-shim "Restored $iana_zone from backup"
+            fi
+        fi
     else
         logger -t canadian-tz-shim "Failed to patch $iana_zone"
+        # Restore from backup if available
+        if [[ -f "${target_zone}.backup" ]]; then
+            cp "${target_zone}.backup" "$target_zone"
+            logger -t canadian-tz-shim "Restored $iana_zone from backup"
+        fi
     fi
 
     # Re-apply symlink only for the selected zone

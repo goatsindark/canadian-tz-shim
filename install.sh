@@ -1,11 +1,60 @@
 #!/usr/bin/env bash
-# Canadian Timezone Shim - Install script
+# Canadian Timezone Shim - Install script with upgrade support
 # Patches Canadian timezone files to use official provincial/territorial abbreviations
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/zones.conf"
+MIGRATIONS_FILE="${SCRIPT_DIR}/migrations.json"
+CURRENT_VERSION="1.0.0"
+
+# Parse command-line arguments
+UPGRADE_MODE=false
+DRY_RUN=false
+SHOW_HELP=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --upgrade)
+            UPGRADE_MODE=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --help|-h)
+            SHOW_HELP=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Show help if requested
+if [[ "$SHOW_HELP" == "true" ]]; then
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Canadian Timezone Shim Installer
+
+Options:
+  --upgrade          Upgrade existing installation to current version
+  --dry-run          Show what would be done without making changes
+  --help, -h         Show this help message
+
+Examples:
+  $0                          # Fresh installation
+  $0 --upgrade                # Upgrade existing installation
+  $0 --upgrade --dry-run      # Show upgrade plan without executing
+
+EOF
+    exit 0
+fi
 
 # Determine installation scope
 if [[ $EUID -eq 0 ]]; then
@@ -13,11 +62,13 @@ if [[ $EUID -eq 0 ]]; then
     ZONEINFO_DIR="/usr/local/share/zoneinfo"
     SYSTEM_WIDE=true
     STATE_DIR="/var/lib/canadian-tz-shim"
+    CONFIG_PATH="/etc/tzshim.conf"
 else
     # Running as user: install to home directory
     ZONEINFO_DIR="${HOME}/.tzinfo"
     SYSTEM_WIDE=false
     STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
+    CONFIG_PATH="${HOME}/.config/tzshim.conf"
 fi
 
 # Colors for output
@@ -44,6 +95,15 @@ header() {
     echo -e "${BLUE}$*${NC}"
 }
 
+# Source upgrade library if in upgrade mode
+if [[ "$UPGRADE_MODE" == "true" ]]; then
+    if [[ ! -f "${SCRIPT_DIR}/lib/upgrade.sh" ]]; then
+        error "Upgrade library not found: ${SCRIPT_DIR}/lib/upgrade.sh"
+        exit 1
+    fi
+    source "${SCRIPT_DIR}/lib/upgrade.sh"
+fi
+
 # Check if config file exists
 if [[ ! -f "$CONFIG_FILE" ]]; then
     error "Configuration file not found: $CONFIG_FILE"
@@ -55,6 +115,90 @@ if ! command -v zdump &>/dev/null; then
     error "zdump command not found. Please install tzdata package."
     exit 1
 fi
+
+# ============================================================================
+# Upgrade Mode
+# ============================================================================
+
+if [[ "$UPGRADE_MODE" == "true" ]]; then
+    header "Canadian Timezone Shim - Upgrade Mode"
+    echo ""
+    
+    # Discover existing installation
+    info "Discovering existing installation..."
+    discover_installation "$SYSTEM_WIDE" "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH"
+    
+    # Report discovery results
+    report_installation_status
+    
+    # Determine upgrade action
+    info "Determining upgrade action..."
+    determine_upgrade_action "$CURRENT_VERSION" "$MIGRATIONS_FILE"
+    
+    # Report decision
+    report_upgrade_decision "$CURRENT_VERSION"
+    echo ""
+    
+    # Handle different states
+    case "$UPGRADE_STATE" in
+        "$UPGRADE_STATE_CURRENT")
+            info "Installation is current and healthy. No action needed."
+            exit 0
+            ;;
+        
+        "$UPGRADE_STATE_NOT_INSTALLED")
+            error "No existing installation found."
+            error "Use '$0' without --upgrade for fresh installation."
+            exit 1
+            ;;
+        
+        "$UPGRADE_STATE_AMBIGUOUS")
+            error "Cannot determine installation state reliably."
+            error "Manual intervention required."
+            error "Consider uninstalling and performing fresh installation."
+            exit 1
+            ;;
+        
+        "$UPGRADE_STATE_UNSUPPORTED")
+            error "No supported upgrade path from ${INSTALLED_VERSION} to ${CURRENT_VERSION}"
+            error "Manual intervention required."
+            exit 1
+            ;;
+        
+        "$UPGRADE_STATE_REPAIR_REQUIRED")
+            warn "Installation requires repair."
+            if [[ "$DRY_RUN" == "true" ]]; then
+                info "Dry run: Would repair installation to ${CURRENT_VERSION}"
+                exit 0
+            fi
+            # Fall through to execute repair
+            ;;
+        
+        "$UPGRADE_STATE_UPGRADE_AVAILABLE")
+            info "Upgrade available: ${INSTALLED_VERSION} → ${CURRENT_VERSION}"
+            if [[ "$DRY_RUN" == "true" ]]; then
+                info "Dry run: Would upgrade installation"
+                exit 0
+            fi
+            # Fall through to execute upgrade
+            ;;
+    esac
+    
+    # Execute upgrade
+    info "Executing upgrade..."
+    if execute_upgrade "$DRY_RUN" "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH" "$MIGRATIONS_FILE"; then
+        info "Upgrade completed successfully!"
+        info "Installation is now at version ${CURRENT_VERSION}"
+        exit 0
+    else
+        error "Upgrade failed."
+        exit 1
+    fi
+fi
+
+# ============================================================================
+# Normal Installation Mode
+# ============================================================================
 
 header "Canadian Timezone Shim Installer"
 echo ""
@@ -183,7 +327,18 @@ verify_tzif_integrity() {
 # Determine which zone to activate (system-wide only)
 selected_zone=""
 original_timezone=""
+original_timezone_path=""
 if [[ "$SYSTEM_WIDE" == "true" ]]; then
+    # Check if we already have saved original timezone metadata
+    if [[ -f "$CONFIG_PATH" ]]; then
+        source "$CONFIG_PATH"
+        original_timezone="${original_timezone:-}"
+        original_timezone_path="${original_timezone_path:-}"
+        if [[ -n "$original_timezone" || -n "$original_timezone_path" ]]; then
+            info "Preserving existing original timezone metadata"
+        fi
+    fi
+
     current_tz=$(detect_current_timezone || echo "")
 
     # Check if current timezone matches one of our zones
@@ -216,14 +371,21 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
         fi
     fi
 
-    # Save the original timezone for restoration during uninstall
-    original_timezone="$current_tz"
+    # Only save original timezone if we don't already have it
+    if [[ -z "$original_timezone" && -z "$original_timezone_path" ]]; then
+        if [[ -n "$current_tz" ]]; then
+            original_timezone="$current_tz"
+        elif [[ -L /etc/localtime ]]; then
+            original_timezone_path=$(readlink -f /etc/localtime)
+        fi
+    fi
 fi
 
 # Read configuration and process each zone
 patched_count=0
 skipped_count=0
 error_count=0
+declare -a successfully_patched_zones=()
 
 while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
     # Skip comments and empty lines
@@ -244,6 +406,13 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         continue
     fi
 
+    # Validate source timezone file structure
+    if ! zdump -v "$system_zone" &>/dev/null; then
+        echo -e "${RED}SKIP${NC} (invalid source timezone file)"
+        error_count=$((error_count + 1))
+        continue
+    fi
+
     # Idempotency check: if already patched, skip
     if [[ -f "$target_zone" ]]; then
         # Check if the official abbreviation is already present in recent dates
@@ -257,6 +426,7 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         if echo "$zdump_output" | grep -q "$verify_year.*$official_abbrev"; then
             echo -e "${YELLOW}SKIP${NC} (already patched)"
             skipped_count=$((skipped_count + 1))
+            successfully_patched_zones+=("$iana_zone")
             continue
         fi
 
@@ -286,18 +456,51 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
             pattern="$verify_year.*$official_abbrev"
 
             if echo "$zdump_output" | grep -q "$pattern"; then
-                echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev ($patch_count locations)"
-                patched_count=$((patched_count + 1))
+                # Verify UTC offset is correct
+                expected_offset=""
+                case "$official_abbrev" in
+                    PCT) expected_offset="-0700" ;;
+                    ABT) expected_offset="-0600" ;;
+                    YST) expected_offset="-0700" ;;
+                    MBT) expected_offset="-0500" ;;
+                    NWT) expected_offset="-0600" ;;
+                esac
+
+                if [[ -n "$expected_offset" ]]; then
+                    # Test a date after the transition
+                    test_date="2026-12-15"
+                    if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
+                        test_date="2021-06-15"
+                    fi
+
+                    actual_offset=$(TZ="$target_zone" date -d "$test_date 12:00:00" +"%z" 2>/dev/null || echo "")
+                    if [[ "$actual_offset" == "$expected_offset" ]]; then
+                        echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev ($patch_count locations)"
+                        patched_count=$((patched_count + 1))
+                        successfully_patched_zones+=("$iana_zone")
+                    else
+                        echo -e "${RED}✗${NC} UTC offset mismatch (expected $expected_offset, got $actual_offset)"
+                        rm -f "$target_zone"
+                        error_count=$((error_count + 1))
+                    fi
+                else
+                    echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev ($patch_count locations)"
+                    patched_count=$((patched_count + 1))
+                    successfully_patched_zones+=("$iana_zone")
+                fi
             else
                 echo -e "${RED}✗${NC} verification failed"
+                rm -f "$target_zone"
                 error_count=$((error_count + 1))
             fi
         else
             echo -e "${RED}✗${NC} integrity check failed"
+            rm -f "$target_zone"
             error_count=$((error_count + 1))
         fi
     else
         echo -e "${RED}✗${NC} no locations patched"
+        rm -f "$target_zone"
         error_count=$((error_count + 1))
     fi
 
@@ -310,6 +513,23 @@ echo "  Zones patched: $patched_count"
 echo "  Zones skipped: $skipped_count"
 echo "  Errors: $error_count"
 echo ""
+
+# Determine installation status
+if [[ $patched_count -eq 0 && $skipped_count -eq 0 ]]; then
+    # Total failure
+    error "No zones were patched. Installation failed."
+    error "Please check the errors above and ensure tzdata is properly installed."
+    exit 1
+elif [[ $error_count -gt 0 && $patched_count -eq 0 ]]; then
+    # All attempted patches failed
+    error "All patch attempts failed. Installation incomplete."
+    error "No timezone activation performed."
+    exit 1
+elif [[ $error_count -gt 0 ]]; then
+    # Partial success
+    warn "Partial installation: $patched_count succeeded, $error_count failed."
+    warn "Only successfully patched zones will be activated."
+fi
 
 if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; then
     if [[ $patched_count -gt 0 ]]; then
@@ -324,24 +544,41 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
         mkdir -p "$STATE_DIR"
         echo "$selected_zone" > "${STATE_DIR}/selected-zone"
 
-        # Save original timezone to /etc/tzshim.conf for restoration during uninstall
-        if [[ -n "$original_timezone" ]]; then
-            echo "original_timezone=$original_timezone" > /etc/tzshim.conf
-            info "Saved original timezone to /etc/tzshim.conf: $original_timezone"
+        # Save original timezone metadata (only if not already saved)
+        if [[ ! -f "$CONFIG_PATH" ]]; then
+            if [[ -n "$original_timezone" ]]; then
+                {
+                    echo "original_timezone=$original_timezone"
+                    echo "installed_version=$CURRENT_VERSION"
+                    echo "schema_version=1"
+                } > "$CONFIG_PATH"
+                info "Saved original timezone to $CONFIG_PATH: $original_timezone"
+            elif [[ -n "$original_timezone_path" ]]; then
+                {
+                    echo "original_timezone_path=$original_timezone_path"
+                    echo "installed_version=$CURRENT_VERSION"
+                    echo "schema_version=1"
+                } > "$CONFIG_PATH"
+                info "Saved original /etc/localtime target to $CONFIG_PATH: $original_timezone_path"
+            fi
         else
-            # If we couldn't detect the original, save the current /etc/localtime target
-            if [[ -L /etc/localtime ]]; then
-                current_link=$(readlink -f /etc/localtime)
-                echo "original_timezone_path=$current_link" > /etc/tzshim.conf
-                info "Saved original /etc/localtime target to /etc/tzshim.conf: $current_link"
+            # Update version in existing config
+            if ! grep -q "^installed_version=" "$CONFIG_PATH" 2>/dev/null; then
+                echo "installed_version=$CURRENT_VERSION" >> "$CONFIG_PATH"
+            fi
+            if ! grep -q "^schema_version=" "$CONFIG_PATH" 2>/dev/null; then
+                echo "schema_version=1" >> "$CONFIG_PATH"
             fi
         fi
 
-        # Create symlink to /etc/localtime
+        # Create symlink to /etc/localtime only if the selected zone was successfully patched
         target_zone="${ZONEINFO_DIR}/${selected_zone}"
         if [[ -f "$target_zone" ]]; then
             ln -sf "$target_zone" /etc/localtime
             info "Updated /etc/localtime → $selected_zone"
+        else
+            warn "Selected zone $selected_zone was not successfully patched"
+            warn "/etc/localtime not updated"
         fi
 
         # Install systemd service
@@ -385,18 +622,33 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
             fi
         done < "$CONFIG_FILE"
     else
-        # Save original timezone to ~/.config/tzshim.conf for restoration during uninstall
-        current_tz=$(detect_current_timezone || echo "")
-        mkdir -p "${HOME}/.config"
-        if [[ -n "$current_tz" ]]; then
-            echo "original_timezone=$current_tz" > "${HOME}/.config/tzshim.conf"
-            info "Saved original timezone to ~/.config/tzshim.conf: $current_tz"
-        else
-            # If we couldn't detect the original, save the current /etc/localtime target
-            if [[ -L /etc/localtime ]]; then
+        # Save original timezone to ~/.config/tzshim.conf (only if not already saved)
+        if [[ ! -f "$CONFIG_PATH" ]]; then
+            current_tz=$(detect_current_timezone || echo "")
+            mkdir -p "${HOME}/.config"
+            if [[ -n "$current_tz" ]]; then
+                {
+                    echo "original_timezone=$current_tz"
+                    echo "installed_version=$CURRENT_VERSION"
+                    echo "schema_version=1"
+                } > "$CONFIG_PATH"
+                info "Saved original timezone to $CONFIG_PATH: $current_tz"
+            elif [[ -L /etc/localtime ]]; then
                 current_link=$(readlink -f /etc/localtime)
-                echo "original_timezone_path=$current_link" > "${HOME}/.config/tzshim.conf"
-                info "Saved original /etc/localtime target to ~/.config/tzshim.conf: $current_link"
+                {
+                    echo "original_timezone_path=$current_link"
+                    echo "installed_version=$CURRENT_VERSION"
+                    echo "schema_version=1"
+                } > "$CONFIG_PATH"
+                info "Saved original /etc/localtime target to $CONFIG_PATH: $current_link"
+            fi
+        else
+            # Update version in existing config
+            if ! grep -q "^installed_version=" "$CONFIG_PATH" 2>/dev/null; then
+                echo "installed_version=$CURRENT_VERSION" >> "$CONFIG_PATH"
+            fi
+            if ! grep -q "^schema_version=" "$CONFIG_PATH" 2>/dev/null; then
+                echo "schema_version=1" >> "$CONFIG_PATH"
             fi
         fi
 
@@ -425,7 +677,4 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
 
     echo ""
     echo "To uninstall, run: ./uninstall.sh"
-else
-    error "No zones were patched. Please check the errors above."
-    exit 1
 fi
