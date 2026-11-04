@@ -158,9 +158,112 @@ def patch_tzif(filename, old_abbrev, new_abbrev):
     return total_patched
 
 
+def validate_tzif(filename):
+    """Validate TZif structure without modifying the file.
+
+    Checks magic bytes, version, header counts, and that every declared
+    block fits inside the file. Rejects malformed, truncated, or non-TZif
+    input. Returns 0 when valid, 1 otherwise.
+    """
+    try:
+        with open(filename, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 1
+
+    HEADER_LEN = 44
+    ABBREV_LEN = 3  # sane minimum abbreviation entry
+
+    def validate_block(data, offset, is_v1):
+        if offset + HEADER_LEN > len(data):
+            return None
+        if data[offset:offset + 4] != b"TZif":
+            return None
+
+        try:
+            counts = struct.unpack(">6I", bytes(data[offset + 20:offset + 44]))
+        except struct.error:
+            return None
+
+        ttisut, ttisstd, leapcnt, timecnt, typecnt, charcnt = counts
+
+        # Reject implausible header values before doing arithmetic
+        if typecnt == 0 or charcnt == 0 or timecnt > 100000:
+            return None
+        if typecnt > 1000 or charcnt > 100000:
+            return None
+
+        tsize = 4 if is_v1 else 8
+        lsize = tsize + 4
+
+        transitions = offset + HEADER_LEN
+        types = transitions + timecnt * tsize
+        ttinfos = types + timecnt
+        abbrevs = ttinfos + typecnt * 6
+        end = abbrevs + charcnt
+
+        # leap seconds, std/wall and utc/local indicators follow the pool
+        end += leapcnt * lsize
+        end += ttisstd + ttisut
+
+        if end > len(data):
+            return None  # truncated
+
+        # The abbreviation pool must contain at least one NUL-terminated entry
+        pool = data[abbrevs:abbrevs + charcnt]
+        if b"\x00" not in pool:
+            return None
+        entries = [e for e in pool.split(b"\x00") if e]
+        if not entries:
+            return None
+        for entry in entries:
+            if not (2 <= len(entry) <= 20):
+                return None
+            if not all(32 <= b < 127 for b in entry):
+                return None
+
+        # Every transition must reference a known local-time type index
+        for i in range(timecnt):
+            if data[types + i] >= typecnt:
+                return None
+
+        return end
+
+    pos = validate_block(data, 0, True)
+    if pos is None:
+        return 1
+
+    version = data[4:5]
+    has_v2 = version in (b"2", b"3", b"4", b"\x3a")
+
+    if has_v2:
+        pos2 = validate_block(data, pos, False)
+        if pos2 is None:
+            return 1
+        # Trailing POSIX-TZ footer (optional), delimited by newlines
+        if pos2 < len(data):
+            if data[pos2:pos2 + 1] != b"\n":
+                return 1
+            nl = data.rfind(b"\n")
+            if nl == -1 or nl < pos2:
+                return 1
+            footer = bytes(data[pos2 + 1:nl]).decode("latin-1").strip()
+            if footer and not (2 <= len(footer) <= 100000):
+                return 1
+
+    return 0
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--validate":
+        sys.exit(validate_tzif(sys.argv[2]))
+
     if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <file> <old_abbrev> <new_abbrev>", file=sys.stderr)
+        print(
+            f"Usage: {sys.argv[0]} <file> <old_abbrev> <new_abbrev>\n"
+            f"       {sys.argv[0]} --validate <file>",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     filename = sys.argv[1]

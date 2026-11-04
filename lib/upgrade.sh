@@ -137,16 +137,19 @@ discover_managed_files() {
         return 0
     fi
     
+    # NOTE: use explicit `if` blocks, never `[[ … ]] && continue`. A failing test
+    # in an AND-OR list returns non-zero, which under `set -e` aborts the enclosing
+    # function and silently leaves MANAGED_FILES empty.
     while IFS='|' read -r iana_zone _rest; do
-        [[ "$iana_zone" =~ ^#.*$ ]] && continue
-        [[ -z "$iana_zone" ]] && continue
-        
+        if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
+        if [[ -z "$iana_zone" ]]; then continue; fi
+
         local target_file="${zoneinfo_dir}/${iana_zone}"
         MANAGED_FILES+=("$target_file")
-        
+
         if [[ ! -f "$target_file" ]]; then
             MISSING_FILES+=("$target_file")
-        elif ! zdump -v "$target_file" &>/dev/null; then
+        elif ! validate_tzif_file "$target_file"; then
             CORRUPTED_FILES+=("$target_file")
         fi
     done < "$config_file"
@@ -162,9 +165,11 @@ validate_installation_health() {
     # For legacy installations without version info, use different health criteria
     if [[ -z "$INSTALLED_VERSION" ]]; then
         # Legacy installation - check basic health indicators
-        # Must have original timezone metadata
-        if [[ -z "$ORIGINAL_TIMEZONE" && -z "$ORIGINAL_TIMEZONE_PATH" ]]; then
-            return 0
+        # Restoration metadata matters only for system-wide installs
+        if [[ "$INSTALLATION_MODE" == "system" ]]; then
+            if [[ -z "$ORIGINAL_TIMEZONE" && -z "$ORIGINAL_TIMEZONE_PATH" ]]; then
+                return 0
+            fi
         fi
         
         # Must have selected zone (for system-wide)
@@ -188,19 +193,24 @@ validate_installation_health() {
         return 0
     fi
     
-    # Check if all managed files exist and are valid
+    # File integrity is required for every mode
     if [[ ${#MISSING_FILES[@]} -gt 0 ]] || [[ ${#CORRUPTED_FILES[@]} -gt 0 ]]; then
         return 0
     fi
     
-    # Check if selected zone is set (for system-wide)
+    # Selected zone is only meaningful for system-wide installs (drives the symlink)
     if [[ "$INSTALLATION_MODE" == "system" && -z "$SELECTED_ZONE" ]]; then
         return 0
     fi
     
-    # Check if original timezone metadata exists
-    if [[ -z "$ORIGINAL_TIMEZONE" && -z "$ORIGINAL_TIMEZONE_PATH" ]]; then
-        return 0
+    # Restoration metadata is only required for system-wide installs, because only
+    # those modify /etc/localtime. A user-level install may legitimately have no
+    # original timezone recorded when the pre-existing /etc/localtime pointed into
+    # another shim directory (self-referential metadata is deliberately rejected).
+    if [[ "$INSTALLATION_MODE" == "system" ]]; then
+        if [[ -z "$ORIGINAL_TIMEZONE" && -z "$ORIGINAL_TIMEZONE_PATH" ]]; then
+            return 0
+        fi
     fi
     
     # All checks passed
@@ -412,8 +422,10 @@ for op in data.get('operations', []):
         return 1
     fi
     
-    # Ensure lock is released on exit
-    trap release_upgrade_lock EXIT
+    # NOTE: intentionally not installing an EXIT trap here. `trap ... EXIT` inside
+    # a library function would silently replace the caller's own EXIT trap (for
+    # example a test suite's cleanup handler). Every return path below releases
+    # the lock explicitly instead.
     
     # Create backup for rollback
     local backup_dir
@@ -436,7 +448,7 @@ for op in data.get('operations', []):
     
     # Validate result
     if [[ "$success" == "true" ]]; then
-        if ! validate_post_upgrade "$zoneinfo_dir" "$config_path"; then
+        if ! validate_post_upgrade "$zoneinfo_dir" "$config_path" "$state_dir"; then
             error "Post-upgrade validation failed"
             success=false
         fi
@@ -447,6 +459,8 @@ for op in data.get('operations', []):
         error "Upgrade failed, initiating rollback..."
         if restore_upgrade_backup "$backup_dir" "$zoneinfo_dir" "$config_path" "$state_dir"; then
             info "Rollback successful"
+            # Rollback completed; the backup is no longer needed
+            rm -rf -- "$backup_dir"
         else
             error "Rollback failed - manual intervention required"
             error "Backup location: $backup_dir"
@@ -492,13 +506,20 @@ create_upgrade_backup() {
         cp -r "$state_dir" "${backup_dir}/state"
     fi
     
-    # Backup timezone files
-    mkdir -p "${backup_dir}/zoneinfo"
+    # Backup timezone files - preserve relative path structure
     for file in "${MANAGED_FILES[@]}"; do
         if [[ -f "$file" ]]; then
-            local basename
-            basename=$(basename "$file")
-            cp "$file" "${backup_dir}/zoneinfo/${basename}"
+            # Get relative path from zoneinfo_dir
+            local rel_path="${file#$zoneinfo_dir/}"
+            local backup_path="${backup_dir}/zoneinfo/${rel_path}"
+            local backup_dir_path
+            backup_dir_path=$(dirname "$backup_path")
+            
+            # Create parent directories
+            mkdir -p "$backup_dir_path"
+            
+            # Copy file
+            cp "$file" "$backup_path"
         fi
     done
     
@@ -523,16 +544,35 @@ restore_upgrade_backup() {
         cp -r "${backup_dir}/state" "$state_dir"
     fi
     
-    # Restore timezone files
-    for file in "${backup_dir}/zoneinfo"/*; do
-        if [[ -f "$file" ]]; then
-            local basename
-            basename=$(basename "$file")
-            cp "$file" "${zoneinfo_dir}/${basename}"
-        fi
-    done
+    # Restore timezone files - preserve relative path structure
+    if [[ -d "${backup_dir}/zoneinfo" ]]; then
+        # Find all files in backup and restore them to their relative positions
+        while IFS= read -r -d '' backup_file; do
+            # Get relative path from backup zoneinfo dir
+            local rel_path="${backup_file#${backup_dir}/zoneinfo/}"
+            local restore_path="${zoneinfo_dir}/${rel_path}"
+            local restore_dir_path
+            restore_dir_path=$(dirname "$restore_path")
+            
+            # Create parent directories if needed
+            mkdir -p "$restore_dir_path"
+            
+            # Copy file back
+            cp "$backup_file" "$restore_path"
+        done < <(find "${backup_dir}/zoneinfo" -type f -print0)
+    fi
     
     return 0
+}
+
+# Derive install mode from a zoneinfo target directory.
+# Self-contained so library functions never depend on unset globals.
+_derive_install_mode() {
+    local zoneinfo_dir="$1"
+    case "$zoneinfo_dir" in
+        /usr/local/share/zoneinfo*) echo "system" ;;
+        *) echo "user" ;;
+    esac
 }
 
 # Execute a single migration operation
@@ -558,11 +598,101 @@ execute_migration_operation() {
             return 0
             ;;
         update_scripts)
-            # Scripts are already updated by the install.sh itself
+            # Update library scripts and patcher.
+            # Derive install mode from the target zoneinfo dir so this operation
+            # does not depend on globals that may be unset in library context.
+            if [[ ! -n "${SCRIPT_DIR:-}" ]]; then
+                error "SCRIPT_DIR is not set; cannot locate source scripts"
+                return 1
+            fi
+            local source_dir="${SCRIPT_DIR}"
+            local upgrade_mode
+            upgrade_mode=$(_derive_install_mode "$zoneinfo_dir")
+
+            local target_lib_dir target_config_dir
+            if [[ "$upgrade_mode" == "system" ]]; then
+                target_lib_dir="/usr/local/libexec/canadian-tz-shim"
+                target_config_dir="/usr/local/share/canadian-tz-shim"
+            else
+                target_lib_dir="${HOME:-/tmp}/.local/lib/canadian-tz-shim"
+                target_config_dir="${HOME:-/tmp}/.local/share/canadian-tz-shim"
+            fi
+
+            mkdir -p "$target_lib_dir"
+
+            # Update patch_tzif.py
+            if [[ -f "${source_dir}/lib/patch_tzif.py" ]]; then
+                cp "${source_dir}/lib/patch_tzif.py" "${target_lib_dir}/patch_tzif.py"
+                chmod +x "${target_lib_dir}/patch_tzif.py"
+            else
+                error "Source patch_tzif.py not found"
+                return 1
+            fi
+
+            # Update reapply.sh
+            if [[ -f "${source_dir}/lib/reapply.sh" ]]; then
+                cp "${source_dir}/lib/reapply.sh" "${target_lib_dir}/reapply.sh"
+                chmod +x "${target_lib_dir}/reapply.sh"
+            else
+                error "Source reapply.sh not found"
+                return 1
+            fi
+
+            # Update upgrade library itself
+            if [[ -f "${source_dir}/lib/upgrade.sh" ]]; then
+                cp "${source_dir}/lib/upgrade.sh" "${target_lib_dir}/upgrade.sh"
+            fi
+
+            # Update zones.conf
+            if [[ -f "${source_dir}/zones.conf" ]]; then
+                mkdir -p "$target_config_dir"
+                cp "${source_dir}/zones.conf" "${target_config_dir}/zones.conf"
+            else
+                error "Source zones.conf not found"
+                return 1
+            fi
+
             return 0
             ;;
         install_systemd)
-            # Systemd installation is handled by install.sh
+            # Install systemd service units (system-wide only)
+            local upgrade_mode
+            upgrade_mode=$(_derive_install_mode "$zoneinfo_dir")
+            if [[ "$upgrade_mode" != "system" ]]; then
+                # Skip systemd installation for user-level installs
+                return 0
+            fi
+
+            local source_dir="${SCRIPT_DIR:-}"
+            
+            # Check if systemd is available
+            if ! command -v systemctl &>/dev/null; then
+                warn "systemctl not available, skipping systemd installation"
+                return 0
+            fi
+            
+            # Install service units
+            if [[ -f "${source_dir}/lib/canadian-tz-shim.service" ]]; then
+                cp "${source_dir}/lib/canadian-tz-shim.service" /etc/systemd/system/
+            else
+                error "canadian-tz-shim.service not found"
+                return 1
+            fi
+            
+            if [[ -f "${source_dir}/lib/canadian-tz-shim.path" ]]; then
+                cp "${source_dir}/lib/canadian-tz-shim.path" /etc/systemd/system/
+            else
+                error "canadian-tz-shim.path not found"
+                return 1
+            fi
+            
+            # Reload systemd
+            systemctl daemon-reload 2>/dev/null || true
+            
+            # Enable and start the path unit
+            systemctl enable canadian-tz-shim.path 2>/dev/null || true
+            systemctl restart canadian-tz-shim.path 2>/dev/null || true
+            
             return 0
             ;;
         update_metadata)
@@ -592,38 +722,34 @@ validate_post_upgrade() {
     local zoneinfo_dir="$1"
     local config_path="$2"
     local state_dir="${3:-}"
-    
-    # Re-discover installation
-    # We need to determine if this is system-wide or user mode
+
     local system_wide="false"
-    if [[ "$zoneinfo_dir" == "/usr/local/share/zoneinfo" ]]; then
+    if [[ "$(_derive_install_mode "$zoneinfo_dir")" == "system" ]]; then
         system_wide="true"
     fi
-    
+
     if [[ -z "$state_dir" ]]; then
         if [[ "$system_wide" == "true" ]]; then
             state_dir="/var/lib/canadian-tz-shim"
         else
-            state_dir="${HOME}/.local/state/canadian-tz-shim"
+            state_dir="${HOME:-/tmp}/.local/state/canadian-tz-shim"
         fi
     fi
-    
+
     discover_installation "$system_wide" "$zoneinfo_dir" "$state_dir" "$config_path"
-    
-    # Check health
+
     if [[ "$INSTALLATION_HEALTHY" != "true" ]]; then
         return 1
     fi
-    
-    # Verify all timezone files are valid
+
     for file in "${MANAGED_FILES[@]}"; do
         if [[ -f "$file" ]]; then
-            if ! zdump -v "$file" &>/dev/null; then
+            if ! validate_tzif_file "$file"; then
                 return 1
             fi
         fi
     done
-    
+
     return 0
 }
 
@@ -659,13 +785,26 @@ report_installation_status() {
     echo "Installation Discovery Results:"
     echo "================================"
     echo ""
-    
+
+    # Distinguish "nothing installed" from "installed by a pre-versioning release".
+    local has_files=false
+    local f
+    for f in "${MANAGED_FILES[@]:-}"; do
+        if [[ -n "$f" && -f "$f" ]]; then has_files=true; break; fi
+    done
+
     if [[ -z "$INSTALLED_VERSION" ]]; then
-        echo "Status: Not installed"
-        return 0
+        if [[ "$has_files" == "true" ]]; then
+            echo "Status: Legacy installation (managed files present, no version metadata)"
+            echo "Installed version: (not recorded by older release)"
+        else
+            echo "Status: Not installed"
+            return 0
+        fi
+    else
+        echo "Installed version: ${INSTALLED_VERSION}"
     fi
-    
-    echo "Installed version: ${INSTALLED_VERSION:-unknown}"
+
     echo "Schema version: ${SCHEMA_VERSION:-unknown}"
     echo "Installation mode: ${INSTALLATION_MODE:-unknown}"
     echo "Selected zone: ${SELECTED_ZONE:-none}"
@@ -729,4 +868,225 @@ report_upgrade_decision() {
             echo "Cannot determine installation state reliably."
             ;;
     esac
+}
+
+# ============================================================================
+# Repair Functionality
+# ============================================================================
+
+# Execute repair operation for installations that are at current version but have issues
+execute_repair() {
+    local zoneinfo_dir="$1"
+    local state_dir="$2"
+    local config_path="$3"
+    local config_file="${SCRIPT_DIR}/zones.conf"
+    
+    info "Starting repair operation..."
+    
+    # Create backup before repair
+    local backup_dir
+    backup_dir=$(create_upgrade_backup "$zoneinfo_dir" "$config_path" "$state_dir")
+    if [[ -z "$backup_dir" ]]; then
+        error "Failed to create backup for repair"
+        return 1
+    fi
+    
+    local repaired_count=0
+    local failed_count=0
+    
+    # Iterate through all managed zones
+    while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
+        if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
+        if [[ -z "$iana_zone" ]]; then continue; fi
+
+        local system_zone="/usr/share/zoneinfo/${iana_zone}"
+        local target_zone="${zoneinfo_dir}/${iana_zone}"
+        
+        # Check if repair is needed
+        local needs_repair=false
+        local repair_reason=""
+        
+        if [[ ! -f "$target_zone" ]]; then
+            needs_repair=true
+            repair_reason="missing"
+        elif ! validate_tzif_file "$target_zone" 2>/dev/null; then
+            needs_repair=true
+            repair_reason="corrupted"
+        else
+            # Check if abbreviation is correct
+            local verify_year="2026"
+            if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
+                verify_year="2020"
+            fi
+            
+            local zdump_output
+            zdump_output=$(zdump -v "$target_zone" 2>/dev/null) || zdump_output=""
+            
+            if ! echo "$zdump_output" | grep -q "$verify_year.*$official_abbrev"; then
+                needs_repair=true
+                repair_reason="incorrect abbreviation"
+            fi
+        fi
+        
+        if [[ "$needs_repair" == "false" ]]; then
+            continue
+        fi
+        
+        info "Repairing $iana_zone (reason: $repair_reason)"
+        
+        # Check source file exists
+        if [[ ! -f "$system_zone" ]]; then
+            error "Source timezone file not found: $system_zone"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+        
+        # Create target directory if needed
+        local target_dir
+        target_dir=$(dirname "$target_zone")
+        mkdir -p "$target_dir"
+        
+        # Copy fresh from system
+        if ! cp "$system_zone" "$target_zone"; then
+            error "Failed to copy $system_zone to $target_zone"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+        
+        # Apply TZif patch
+        local patch_count
+        patch_count=$(python3 "${SCRIPT_DIR}/lib/patch_tzif.py" "$target_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
+        
+        if [[ "$patch_count" -le 0 ]]; then
+            error "Failed to patch $iana_zone"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+        
+        # Validate the repair
+        if ! validate_tzif_file "$target_zone"; then
+            error "Validation failed after repair of $iana_zone"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+        
+        # Verify UTC offset
+        local expected_offset=""
+        case "$official_abbrev" in
+            PCT) expected_offset="-0700" ;;
+            ABT) expected_offset="-0600" ;;
+            YST) expected_offset="-0700" ;;
+            MBT) expected_offset="-0500" ;;
+            NWT) expected_offset="-0600" ;;
+        esac
+        
+        if [[ -n "$expected_offset" ]]; then
+            local test_date="2026-12-15"
+            if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
+                test_date="2021-06-15"
+            fi
+            
+            local actual_offset
+            actual_offset=$(TZ="$target_zone" date -d "$test_date 12:00:00" +"%z" 2>/dev/null || echo "")
+            
+            if [[ "$actual_offset" != "$expected_offset" ]]; then
+                error "UTC offset mismatch after repair of $iana_zone (expected $expected_offset, got $actual_offset)"
+                failed_count=$((failed_count + 1))
+                continue
+            fi
+        fi
+        
+        info "✓ Successfully repaired $iana_zone"
+        repaired_count=$((repaired_count + 1))
+        
+    done < "$config_file"
+    
+    # Validate entire installation after repair
+    info "Validating installation after repair..."
+    if ! validate_post_upgrade "$zoneinfo_dir" "$config_path" "$state_dir"; then
+        error "Post-repair validation failed, rolling back..."
+        if restore_upgrade_backup "$backup_dir" "$zoneinfo_dir" "$config_path" "$state_dir"; then
+            info "Rollback successful"
+            rm -rf -- "$backup_dir"
+        else
+            error "Rollback failed - manual intervention required"
+            error "Backup location: $backup_dir"
+        fi
+        return 1
+    fi
+    
+    # Clean up backup
+    rm -rf "$backup_dir"
+    
+    info "Repair complete: $repaired_count repaired, $failed_count failed"
+    
+    if [[ $failed_count -gt 0 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validate a TZif file for integrity
+validate_tzif_file() {
+    local file="$1"
+    
+    # Check file exists
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+    
+    # Check file size is reasonable
+    local file_size
+    file_size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    
+    if [[ "$file_size" -lt 100 ]]; then
+        # Unreasonably small file
+        return 1
+    fi
+    
+    # Check that it has valid TZif magic bytes using hexdump
+    local magic
+    magic=$(hexdump -C "$file" 2>/dev/null | head -1 | awk '{print $2 $3 $4 $5}' || echo "")
+    
+    # Valid TZif magic bytes are "TZif" (54 5a 69 66)
+    if [[ "$magic" != "545a6966" ]]; then
+        # Not a valid TZif file - could be corrupted text or other garbage
+        local first_line
+        first_line=$(head -1 "$file" 2>/dev/null || echo "")
+        if [[ "$first_line" == "corrupted data" ]]; then
+            # This is definitely corrupted
+            return 1
+        fi
+        # Also check if it's just plain text
+        if [[ "$first_line" != "TZif"* ]] && [[ "$file_size" -lt 1000 ]]; then
+            # If it's small and not a proper TZif file, likely corrupted
+            return 1
+        fi
+    fi
+    
+    # Validate file structure using zdump
+    if ! zdump -v "$file" &>/dev/null; then
+        # zdump failed, but we should also check for malformed TZif
+        return 1
+    fi
+    
+    # Reject non-TZif input using the dedicated, read-only structural validator.
+    # This does not write to the file and produces no stdout noise.
+    if ! command -v python3 &>/dev/null; then
+        # Fail closed: without python3 we cannot perform reliable validation
+        return 1
+    fi
+
+    local validator="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/patch_tzif.py"
+    if [[ ! -f "$validator" ]]; then
+        # Fail closed: validator missing means we cannot trust this file
+        return 1
+    fi
+
+    if ! python3 "$validator" --validate "$file" 2>/dev/null; then
+        return 1
+    fi
+
+    return 0
 }

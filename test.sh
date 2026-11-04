@@ -7,6 +7,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/zones.conf"
 
+# Isolated sandbox for user-mode runs so no test can touch the real home directory
+REAL_HOME="${HOME}"
+SANDBOX_ROOT="$(mktemp -d "/tmp/tzshim-sandbox-XXXXXX")"
+
 # Test mode: user or system
 if [[ "${1:-}" == "--system" ]] || [[ $EUID -eq 0 ]]; then
     TEST_MODE="system"
@@ -15,9 +19,30 @@ if [[ "${1:-}" == "--system" ]] || [[ $EUID -eq 0 ]]; then
     CONFIG_PATH="/etc/tzshim.conf"
 else
     TEST_MODE="user"
+    # Redirect HOME into the sandbox; ZONEINFO_DIR/STATE_DIR/CONFIG_PATH derive from it
+    export HOME="${SANDBOX_ROOT}/home"
+    mkdir -p "$HOME"
     ZONEINFO_DIR="${HOME}/.tzinfo"
     STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
     CONFIG_PATH="${HOME}/.config/tzshim.conf"
+fi
+
+sandbox_cleanup() {
+    case "$SANDBOX_ROOT" in
+        /tmp/tzshim-sandbox-*) rm -rf -- "$SANDBOX_ROOT" ;;
+        *) echo "REFUSING to remove unexpected sandbox path: $SANDBOX_ROOT" >&2 ;;
+    esac
+}
+trap sandbox_cleanup EXIT
+
+# Hard guard: in user mode we must never operate on the developer's real home
+if [[ "$TEST_MODE" == "user" ]]; then
+    case "$HOME" in
+        "$REAL_HOME")
+            echo "FATAL: user-mode tests must not run against the real HOME ($REAL_HOME)" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 # Colors for output
@@ -54,6 +79,26 @@ echo ""
 
 total_tests=0
 passed_tests=0
+
+# Bootstrap: establish a known-good installation to test against.
+# In user mode this installs into the sandbox HOME, never the real home.
+header "Bootstrap: installing into ${TEST_MODE} target"
+if [[ "$TEST_MODE" == "user" ]]; then
+    # Non-interactive user-level install
+    if ! bash "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1; then
+        fail "Bootstrap install.sh failed in sandbox HOME=$HOME"
+    fi
+    if [[ ! -f "$ZONEINFO_DIR/America/Vancouver" ]]; then
+        fail "Bootstrap did not create patched timezone files in $ZONEINFO_DIR"
+    fi
+    pass "Installed into sandbox: $ZONEINFO_DIR"
+else
+    info "System mode: expects an existing system-wide installation"
+    if [[ ! -f "$ZONEINFO_DIR/America/Vancouver" ]]; then
+        fail "No system-wide installation found at $ZONEINFO_DIR (run: sudo ./install.sh)"
+    fi
+fi
+echo ""
 
 # Test 1: Verify installation
 header "Test Group 1: Installation Verification"
@@ -281,47 +326,58 @@ fi
 echo ""
 
 # Test 6: Config file preservation test
-header "Test Group 6: Config File Preservation Test"
-info "Test: Config file contains original timezone information"
+header "Test Group 6: Config File Integrity"
+total_tests=$((total_tests + 1))
 if [[ -f "$CONFIG_PATH" ]]; then
-    if grep -q "original_timezone" "$CONFIG_PATH"; then
-        total_tests=$((total_tests + 1))
+    if grep -q "^installed_version=" "$CONFIG_PATH"; then
         passed_tests=$((passed_tests + 1))
-        pass "Config file contains original timezone information"
+        pass "Config records installed_version"
     else
-        total_tests=$((total_tests + 1))
-        fail "Config file does not contain original timezone information"
+        fail "Config does not record installed_version"
     fi
 else
-    total_tests=$((total_tests + 1))
-    fail "Config file not found"
+    fail "Config file not found at $CONFIG_PATH"
+fi
+
+# Regression: metadata must never point restoration back into a shim directory
+total_tests=$((total_tests + 1))
+if grep -Eq '^(original_timezone|original_timezone_path)=.*/(usr/local/share/zoneinfo|\.tzinfo)/' "$CONFIG_PATH" 2>/dev/null; then
+    fail "Self-referential restoration metadata present (would break uninstall)"
+else
+    passed_tests=$((passed_tests + 1))
+    pass "Restoration metadata is not self-referential"
 fi
 echo ""
 
-# Test 7: Reinstallation preserves original timezone
+# Test 7: Reinstallation preserves original timezone metadata
 header "Test Group 7: Reinstallation Metadata Preservation"
 if [[ -f "$CONFIG_PATH" ]]; then
-    original_value=$(grep "original_timezone" "$CONFIG_PATH" | cut -d= -f2)
+    original_value=$( { grep '^original_timezone' "$CONFIG_PATH" || true; } | sort )
 
     info "Test: Reinstalling should preserve original timezone metadata"
     bash "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1 || true
 
     if [[ -f "$CONFIG_PATH" ]]; then
-        new_value=$(grep "original_timezone" "$CONFIG_PATH" | cut -d= -f2)
+        new_value=$( { grep '^original_timezone' "$CONFIG_PATH" || true; } | sort )
         if [[ "$original_value" == "$new_value" ]]; then
             total_tests=$((total_tests + 1))
             passed_tests=$((passed_tests + 1))
-            pass "Original timezone metadata preserved across reinstallation"
+            if [[ -z "$original_value" ]]; then
+                pass "Absent restoration metadata not fabricated on reinstall"
+            else
+                pass "Original timezone metadata preserved across reinstallation"
+            fi
         else
             total_tests=$((total_tests + 1))
-            fail "Original timezone metadata changed: $original_value → $new_value"
+            fail "Original timezone metadata changed: [$original_value] → [$new_value]"
         fi
     else
         total_tests=$((total_tests + 1))
         fail "Config file disappeared after reinstallation"
     fi
 else
-    info "Test: Skipped (no config file)"
+    total_tests=$((total_tests + 1))
+    fail "Config file not found for reinstallation test"
 fi
 echo ""
 

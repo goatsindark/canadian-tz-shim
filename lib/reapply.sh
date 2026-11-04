@@ -49,6 +49,7 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
 
     system_zone="/usr/share/zoneinfo/${iana_zone}"
     target_zone="${ZONEINFO_DIR}/${iana_zone}"
+    temp_zone="${ZONEINFO_DIR}/${iana_zone}.tmp"
 
     # Only re-patch if the target zone exists (was previously installed)
     if [[ ! -f "$target_zone" ]]; then
@@ -66,11 +67,11 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         continue
     fi
 
-    # Copy fresh from system and patch
-    cp "$system_zone" "$target_zone"
+    # Stage replacement in temporary location
+    cp "$system_zone" "$temp_zone"
 
     # Use the required Python patcher
-    patch_count=$(python3 "$PATCH_SCRIPT" "$target_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
+    patch_count=$(python3 "$PATCH_SCRIPT" "$temp_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
 
     if [[ "$patch_count" -gt 0 ]]; then
         # Verify the patch worked
@@ -79,11 +80,48 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
             verify_year="2020"
         fi
 
-        zdump_output=$(zdump -v "$target_zone" 2>/dev/null)
+        zdump_output=$(zdump -v "$temp_zone" 2>/dev/null)
         if echo "$zdump_output" | grep -q "$verify_year.*$official_abbrev"; then
+            # Validate UTC offset
+            expected_offset=""
+            case "$official_abbrev" in
+                PCT) expected_offset="-0700" ;;
+                ABT) expected_offset="-0600" ;;
+                YST) expected_offset="-0700" ;;
+                MBT) expected_offset="-0500" ;;
+                NWT) expected_offset="-0600" ;;
+            esac
+
+            if [[ -n "$expected_offset" ]]; then
+                # Test a date after the transition
+                test_date="2026-12-15"
+                if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
+                    test_date="2021-06-15"
+                fi
+
+                actual_offset=$(TZ="$temp_zone" date -d "$test_date 12:00:00" +"%z" 2>/dev/null || echo "")
+                if [[ "$actual_offset" != "$expected_offset" ]]; then
+                    logger -t canadian-tz-shim "UTC offset mismatch for $iana_zone (expected $expected_offset, got $actual_offset)"
+                    rm -f "$temp_zone"
+                    # Restore from backup if available
+                    if [[ -f "${target_zone}.backup" ]]; then
+                        cp "${target_zone}.backup" "$target_zone"
+                        logger -t canadian-tz-shim "Restored $iana_zone from backup"
+                    fi
+                    continue
+                fi
+            fi
+            
+            # Atomic replacement: backup original and replace
+            if [[ -f "$target_zone" ]]; then
+                cp "$target_zone" "${target_zone}.backup.$(date +%s)"
+            fi
+            mv "$temp_zone" "$target_zone"
+            
             logger -t canadian-tz-shim "Re-patched $iana_zone ($iana_abbrev → $official_abbrev, $patch_count locations)"
         else
             logger -t canadian-tz-shim "Failed to verify patch for $iana_zone"
+            rm -f "$temp_zone"
             # Restore from backup if available
             if [[ -f "${target_zone}.backup" ]]; then
                 cp "${target_zone}.backup" "$target_zone"
@@ -92,6 +130,7 @@ while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name refere
         fi
     else
         logger -t canadian-tz-shim "Failed to patch $iana_zone"
+        rm -f "$temp_zone"
         # Restore from backup if available
         if [[ -f "${target_zone}.backup" ]]; then
             cp "${target_zone}.backup" "$target_zone"

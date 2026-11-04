@@ -5,6 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="/tmp/tzshim-test-$$"
+TEMP_HOME="/tmp/tzshim-temp-home-$$"
 
 # Colors
 RED='\033[0;31m'
@@ -27,17 +28,37 @@ info() {
 
 cleanup() {
     info "Cleaning up test environment..."
-    rm -rf "$TEST_DIR"
-    rm -f "$HOME/.config/tzshim.conf"
-    rm -rf "$HOME/.tzinfo"
-    rm -rf "$HOME/.zoneinfo"
+    # Only remove paths that match our expected, uniquely-suffixed test prefixes.
+    # This prevents ever deleting a real user path or a path built from garbage data.
+    for candidate in "$TEST_DIR" "$TEMP_HOME"; do
+        case "$candidate" in
+            /tmp/tzshim-test-$$|/tmp/tzshim-temp-home-$$)
+                rm -rf -- "$candidate"
+                ;;
+            *)
+                info "REFUSING to clean unexpected path: $candidate" >&2
+                ;;
+        esac
+    done
 }
 
 trap cleanup EXIT
 
+# Refuse to run if the test paths are not properly isolated
+case "$TEST_DIR" in
+    /tmp/tzshim-test-$$) ;;
+    *) echo "FATAL: TEST_DIR is not an isolated path: $TEST_DIR" >&2; exit 1 ;;
+esac
+case "$TEMP_HOME" in
+    /tmp/tzshim-temp-home-$$) ;;
+    *) echo "FATAL: TEMP_HOME is not an isolated path: $TEMP_HOME" >&2; exit 1 ;;
+esac
+
 setup_test_env() {
+    # Creates fixtures under the global TEST_DIR; produces no stdout
     info "Setting up test environment..."
     mkdir -p "$TEST_DIR/zoneinfo/America"
+    mkdir -p "$TEMP_HOME/.config"
     
     # Copy some timezone files
     for zone in Vancouver Edmonton Whitehorse Dawson Winnipeg Yellowknife; do
@@ -47,8 +68,6 @@ setup_test_env() {
     # Create some orphaned files (from hypothetical older version)
     touch "$TEST_DIR/zoneinfo/America/OldZone"
     touch "$TEST_DIR/zoneinfo/America/Legacy.backup.123"
-    
-    echo "$TEST_DIR"
 }
 
 test_missing_config() {
@@ -56,14 +75,14 @@ test_missing_config() {
     
     local test_dir="$1"
     
-    # Ensure no config file exists
-    rm -f "$HOME/.config/tzshim.conf"
+    # Ensure no config file exists in temp home
+    rm -f "$TEMP_HOME/.config/tzshim.conf"
     
     # Set TZ to point to one of our patched zones
     export TZ="$test_dir/zoneinfo/America/Vancouver"
     
-    # Run uninstall in user mode (no sudo)
-    if echo "y" | "$SCRIPT_DIR/uninstall.sh" 2>&1 | grep -q "Removed ~/.config/tzshim.conf\|No config file"; then
+    # Run uninstall in user mode (no sudo) using temp home
+    if echo "y" | HOME="$TEMP_HOME" "$SCRIPT_DIR/uninstall.sh" 2>&1 | grep -q "Removed.*tzshim.conf\|No config file"; then
         pass "Handles missing config gracefully in user mode"
     else
         pass "User mode uninstall completes without config"
@@ -85,17 +104,17 @@ test_orphaned_files() {
     done
     touch "$test_dir/zoneinfo/America/OldZone"
     
-    # Create a valid config
-    mkdir -p "$HOME/.config"
-    cat > "$HOME/.config/tzshim.conf" <<EOF
+    # Create a valid config in temp home
+    mkdir -p "$TEMP_HOME/.config"
+    cat > "$TEMP_HOME/.config/tzshim.conf" <<EOF
 original_timezone=America/Los_Angeles
 EOF
     
     # Temporarily override ZONEINFO_DIR for testing
     export ZONEINFO_DIR="$test_dir/zoneinfo"
     
-    # Run uninstall
-    if echo "y" | "$SCRIPT_DIR/uninstall.sh" 2>&1 | grep -q "orphaned file\|Removed: Vancouver"; then
+    # Run uninstall using temp home
+    if echo "y" | HOME="$TEMP_HOME" "$SCRIPT_DIR/uninstall.sh" 2>&1 | grep -q "orphaned file\|Removed: Vancouver"; then
         pass "Detects and reports orphaned files"
     else
         pass "User mode uninstall processes files"
@@ -107,20 +126,18 @@ EOF
 test_legacy_directories() {
     info "Test 3: Detection of legacy directories"
     
-    # Create legacy directories
-    mkdir -p /tmp/legacy-zoneinfo
-    mkdir -p "$HOME/.zoneinfo"
+    # Create legacy directories in temp home
+    mkdir -p "$TEMP_HOME/.zoneinfo"
     
-    # Run uninstall
-    if echo "y" | "$SCRIPT_DIR/uninstall.sh" 2>&1 | grep -q "legacy installation directory\|Uninstallation complete"; then
+    # Run uninstall using temp home
+    if echo "y" | HOME="$TEMP_HOME" "$SCRIPT_DIR/uninstall.sh" 2>&1 | grep -q "legacy installation directory\|Uninstallation complete"; then
         pass "Detects or handles legacy directories"
     else
         pass "Uninstall completes with legacy directories present"
     fi
     
     # Cleanup
-    rm -rf /tmp/legacy-zoneinfo
-    rm -rf "$HOME/.zoneinfo"
+    rm -rf "$TEMP_HOME/.zoneinfo"
 }
 
 test_help_flag() {
@@ -137,7 +154,7 @@ test_force_flag() {
     info "Test 5: Force flag parsing"
     
     # Just check that the flag is accepted (can't test actual force behavior without sudo)
-    if "$SCRIPT_DIR/uninstall.sh" --help 2>&1 | grep -q "\-\-force"; then
+    if "$SCRIPT_DIR/uninstall.sh" --help 2>&1 | grep -q -- "--force"; then
         pass "Documents --force flag in help"
     else
         fail "Should document --force flag"
@@ -147,24 +164,24 @@ test_force_flag() {
 test_config_preservation() {
     info "Test 6: Config file handling"
     
-    # Create config
-    mkdir -p "$HOME/.config"
-    cat > "$HOME/.config/tzshim.conf" <<EOF
+    # Create config in temp home
+    mkdir -p "$TEMP_HOME/.config"
+    cat > "$TEMP_HOME/.config/tzshim.conf" <<EOF
 original_timezone=America/New_York
 EOF
     
     # Verify config exists
-    if [[ -f "$HOME/.config/tzshim.conf" ]]; then
+    if [[ -f "$TEMP_HOME/.config/tzshim.conf" ]]; then
         pass "Config file created"
     else
         fail "Should create config file"
     fi
     
-    # Run uninstall
-    echo "y" | "$SCRIPT_DIR/uninstall.sh" > /dev/null 2>&1 || true
+    # Run uninstall using temp home
+    echo "y" | HOME="$TEMP_HOME" "$SCRIPT_DIR/uninstall.sh" > /dev/null 2>&1 || true
     
     # Check if config was removed
-    if [[ ! -f "$HOME/.config/tzshim.conf" ]]; then
+    if [[ ! -f "$TEMP_HOME/.config/tzshim.conf" ]]; then
         pass "Config file removed during uninstall"
     else
         fail "Should remove config file during uninstall"
@@ -179,8 +196,9 @@ main() {
     echo "========================================"
     echo
     
-    local test_dir
-    test_dir=$(setup_test_env)
+    # Use the global TEST_DIR directly; no command substitution needed
+    setup_test_env
+    local test_dir="$TEST_DIR"
     
     test_help_flag
     echo

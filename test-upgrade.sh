@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="/tmp/canadian-tz-shim-upgrade-tests-$$"
 FIXTURES_DIR="${TEST_DIR}/fixtures"
+# Hermetic HOME so tests can never read or write the real user's installation
+ISOLATED_HOME="${TEST_DIR}/home"
 
 # Colors
 RED='\033[0;31m'
@@ -44,6 +46,7 @@ setup_test_environment() {
     info "Setting up test environment..."
     mkdir -p "$TEST_DIR"
     mkdir -p "$FIXTURES_DIR"
+    mkdir -p "$ISOLATED_HOME/.config"
     
     # Create fixture directories
     mkdir -p "${FIXTURES_DIR}/v1.0.0_healthy"
@@ -184,8 +187,22 @@ EOF
 
 cleanup_test_environment() {
     info "Cleaning up test environment..."
-    rm -rf "$TEST_DIR"
+    # Refuse to remove anything that is not our uniquely-suffixed test tree
+    case "$TEST_DIR" in
+        /tmp/canadian-tz-shim-upgrade-tests-$$) rm -rf -- "$TEST_DIR" ;;
+        *) info "REFUSING to clean unexpected path: $TEST_DIR" >&2 ;;
+    esac
 }
+
+# Guard: never run against non-isolated paths
+case "$TEST_DIR" in
+    /tmp/canadian-tz-shim-upgrade-tests-$$) ;;
+    *) echo "FATAL: TEST_DIR is not an isolated path: $TEST_DIR" >&2; exit 1 ;;
+esac
+case "$ISOLATED_HOME" in
+    /tmp/canadian-tz-shim-upgrade-tests-$$/home) ;;
+    *) echo "FATAL: ISOLATED_HOME is not an isolated path: $ISOLATED_HOME" >&2; exit 1 ;;
+esac
 
 # ============================================================================
 # Test Cases
@@ -581,6 +598,9 @@ main() {
     
     # Setup
     setup_test_environment
+    
+    # Isolate HOME so no test can observe or modify the real user installation
+    export HOME="$ISOLATED_HOME"
     
     # Run tests
     test_upgrade_detection_current

@@ -168,10 +168,17 @@ if [[ "$UPGRADE_MODE" == "true" ]]; then
         "$UPGRADE_STATE_REPAIR_REQUIRED")
             warn "Installation requires repair."
             if [[ "$DRY_RUN" == "true" ]]; then
-                info "Dry run: Would repair installation to ${CURRENT_VERSION}"
+                info "Dry run: Would repair installation"
                 exit 0
             fi
-            # Fall through to execute repair
+            # Execute repair
+            if execute_repair "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH"; then
+                info "Repair completed successfully!"
+                exit 0
+            else
+                error "Repair failed."
+                exit 1
+            fi
             ;;
         
         "$UPGRADE_STATE_UPGRADE_AVAILABLE")
@@ -217,12 +224,21 @@ else
 fi
 
 # Detect current timezone
+# Only accepts the canonical system zoneinfo directory (/usr/share/zoneinfo).
+# A /etc/localtime that points into any shim install directory is NOT an original
+# timezone - recording it would create self-referential restoration metadata.
 detect_current_timezone() {
     if [[ -L /etc/localtime ]]; then
         local target
         target=$(readlink -f /etc/localtime)
-        # Extract zone name from path
-        if [[ "$target" =~ /zoneinfo/(.*) ]]; then
+        # Reject targets inside this install's dir and the system-wide shim dir
+        case "$target" in
+            "$ZONEINFO_DIR"/*|/usr/local/share/zoneinfo/*)
+                return 1
+                ;;
+        esac
+        # Extract zone name from the canonical system path
+        if [[ "$target" =~ ^/usr/share/zoneinfo/(.*) ]]; then
             echo "${BASH_REMATCH[1]}"
             return 0
         fi
@@ -237,8 +253,10 @@ show_timezone_menu() {
     local names=()
 
     while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
-        [[ "$iana_zone" =~ ^#.*$ ]] && continue
-        [[ -z "$iana_zone" ]] && continue
+        # Explicit `if` guards: `[[ … ]] && continue` returns non-zero when the test
+        # fails, which aborts this function under `set -e`.
+        if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
+        if [[ -z "$iana_zone" ]]; then continue; fi
         zones+=("$iana_zone")
         names+=("$official_name ($official_abbrev)")
     done < "$CONFIG_FILE"
@@ -268,8 +286,9 @@ show_timezone_menu() {
 validate_zone() {
     local zone="$1"
     while IFS='|' read -r iana_zone _rest; do
-        [[ "$iana_zone" =~ ^#.*$ ]] && continue
-        [[ -z "$iana_zone" ]] && continue
+        # Explicit `if` guards so a failing test cannot abort this function under set -e
+        if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
+        if [[ -z "$iana_zone" ]]; then continue; fi
         if [[ "$iana_zone" == "$zone" ]]; then
             return 0
         fi
@@ -334,6 +353,24 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
         source "$CONFIG_PATH"
         original_timezone="${original_timezone:-}"
         original_timezone_path="${original_timezone_path:-}"
+
+        # Reject self-referential metadata written by older releases.
+        # original_timezone_path must not resolve inside the shim's own install dir.
+        if [[ -n "$original_timezone_path" ]]; then
+            case "$original_timezone_path" in
+                "$ZONEINFO_DIR"/*)
+                    warn "Discarding self-referential original_timezone_path from $CONFIG_PATH"
+                    original_timezone_path=""
+                    ;;
+            esac
+        fi
+
+        # original_timezone must name a real system zone
+        if [[ -n "$original_timezone" && ! -f "/usr/share/zoneinfo/$original_timezone" ]]; then
+            warn "Discarding invalid original_timezone from $CONFIG_PATH: $original_timezone"
+            original_timezone=""
+        fi
+
         if [[ -n "$original_timezone" || -n "$original_timezone_path" ]]; then
             info "Preserving existing original timezone metadata"
         fi
@@ -376,7 +413,11 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
         if [[ -n "$current_tz" ]]; then
             original_timezone="$current_tz"
         elif [[ -L /etc/localtime ]]; then
-            original_timezone_path=$(readlink -f /etc/localtime)
+            # Only accept a canonical system zoneinfo path; never a shim path
+            candidate=$(readlink -f /etc/localtime)
+            case "$candidate" in
+                /usr/share/zoneinfo/*) original_timezone_path="$candidate" ;;
+            esac
         fi
     fi
 fi
@@ -635,12 +676,24 @@ if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; t
                 info "Saved original timezone to $CONFIG_PATH: $current_tz"
             elif [[ -L /etc/localtime ]]; then
                 current_link=$(readlink -f /etc/localtime)
-                {
-                    echo "original_timezone_path=$current_link"
-                    echo "installed_version=$CURRENT_VERSION"
-                    echo "schema_version=1"
-                } > "$CONFIG_PATH"
-                info "Saved original /etc/localtime target to $CONFIG_PATH: $current_link"
+                # Only accept a canonical system zoneinfo path; never a shim path
+                case "$current_link" in
+                    /usr/share/zoneinfo/*)
+                        {
+                            echo "original_timezone_path=$current_link"
+                            echo "installed_version=$CURRENT_VERSION"
+                            echo "schema_version=1"
+                        } > "$CONFIG_PATH"
+                        info "Saved original /etc/localtime target to $CONFIG_PATH: $current_link"
+                        ;;
+                    *)
+                        info "No canonical original timezone detectable; not writing restoration metadata"
+                        {
+                            echo "installed_version=$CURRENT_VERSION"
+                            echo "schema_version=1"
+                        } > "$CONFIG_PATH"
+                        ;;
+                esac
             fi
         else
             # Update version in existing config

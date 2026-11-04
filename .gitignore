@@ -1,3 +1,18 @@
-# PCT Shim
+# Canadian Timezone Shim
 
-~/.tzinfo/
+# Release packaging output
+dist/
+
+# Test/runtime scratch (created under /tmp, but guard against strays)
+*.tmp
+*.backup.*
+*.bak
+*.old
+
+# Python bytecode from the TZif patcher
+__pycache__/
+*.pyc
+
+# Never ignore the tracked state/config dirs used by real installs in this repo:
+# the shim writes to $HOME/.tzinfo and $HOME/.config/tzshim.conf at runtime,
+# which are outside this repository, so no ignore rule is needed here.

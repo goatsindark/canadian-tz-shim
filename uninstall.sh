@@ -166,18 +166,40 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
         fi
     elif [[ -n "$original_timezone_path" ]]; then
         # Restore to the original path
-        if [[ -f "$original_timezone_path" ]]; then
-            info "Restoring /etc/localtime to original path: $original_timezone_path"
-            if ln -sf "$original_timezone_path" /etc/localtime; then
-                info "✓ /etc/localtime restored successfully"
+        # SAFETY: metadata recorded by an older release could point back into the
+        # shim's own install directory. Restoring to such a path and then deleting
+        # it would leave /etc/localtime dangling and break the system timezone.
+        case "$original_timezone_path" in
+            "$ZONEINFO_DIR"/*)
+                rel_path="${original_timezone_path#$ZONEINFO_DIR/}"
+                mapped_path="/usr/share/zoneinfo/${rel_path}"
+                warn "Saved original path points inside the shim install directory (self-referential metadata)."
+                if [[ -f "$mapped_path" ]]; then
+                    info "Recovering to equivalent system timezone: $mapped_path"
+                    original_timezone_path="$mapped_path"
+                else
+                    warn "No equivalent system timezone found for: $rel_path"
+                    warn "/etc/localtime not restored"
+                    restoration_failed=true
+                    original_timezone_path=""
+                fi
+                ;;
+        esac
+
+        if [[ -n "$original_timezone_path" ]]; then
+            if [[ -f "$original_timezone_path" ]]; then
+                info "Restoring /etc/localtime to original path: $original_timezone_path"
+                if ln -sf "$original_timezone_path" /etc/localtime; then
+                    info "✓ /etc/localtime restored successfully"
+                else
+                    error "Failed to restore /etc/localtime"
+                    restoration_failed=true
+                fi
             else
-                error "Failed to restore /etc/localtime"
+                warn "Original timezone file not found: $original_timezone_path"
+                warn "/etc/localtime not restored"
                 restoration_failed=true
             fi
-        else
-            warn "Original timezone file not found: $original_timezone_path"
-            warn "/etc/localtime not restored"
-            restoration_failed=true
         fi
     else
         # No config file or no original timezone info
@@ -303,6 +325,21 @@ for legacy_state in "${HOME}/.local/state/canadian-tz-shim" "/var/lib/canadian-t
         rm -rf "$legacy_state"
     fi
 done
+
+# SAFETY: never delete timezone files that /etc/localtime still resolves to.
+# This catches self-referential metadata and any silent restoration failure.
+if [[ "$SYSTEM_WIDE" == "true" ]]; then
+    localtime_target=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    case "$localtime_target" in
+        "$ZONEINFO_DIR"/*)
+            error "/etc/localtime still resolves inside $ZONEINFO_DIR ($localtime_target)."
+            error "Refusing to delete timezone files the system still depends on."
+            error "Restore /etc/localtime manually, then re-run uninstall:"
+            error "  sudo ln -sf /usr/share/zoneinfo/<Region/City> /etc/localtime"
+            exit 1
+            ;;
+    esac
+fi
 
 # Safely remove only the timezone files we created
 if [[ -d "$ZONEINFO_DIR" ]]; then
