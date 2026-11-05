@@ -28,6 +28,7 @@ MISSING_FILES=()
 CORRUPTED_FILES=()
 UPGRADE_STATE=""
 UPGRADE_PATH=""
+SELECTED_CUSTOM_ZONE=""
 
 # Color codes (if not already defined)
 if [[ -z "${RED:-}" ]]; then
@@ -68,6 +69,7 @@ discover_installation() {
     SCHEMA_VERSION=""
     INSTALLATION_MODE=""
     SELECTED_ZONE=""
+    SELECTED_CUSTOM_ZONE=""
     ORIGINAL_TIMEZONE=""
     ORIGINAL_TIMEZONE_PATH=""
     INSTALLATION_HEALTHY=false
@@ -109,9 +111,16 @@ discover_installation() {
         INSTALLATION_MODE="user"
     fi
     
-    # Check for selected zone
-    if [[ -f "${state_dir}/selected-zone" ]]; then
+    # Check for selected zone — prefer the new 2.x state files, fall
+    # back to the legacy single-field file for 1.x installs.
+    if [[ -f "${state_dir}/selected-source-zone" ]]; then
+        SELECTED_ZONE=$(cat "${state_dir}/selected-source-zone")
+        SELECTED_CUSTOM_ZONE=$(cat "${state_dir}/selected-custom-zone" 2>/dev/null || echo "")
+    elif [[ -f "${state_dir}/selected-zone" ]]; then
         SELECTED_ZONE=$(cat "${state_dir}/selected-zone")
+        SELECTED_CUSTOM_ZONE=""
+    else
+        SELECTED_CUSTOM_ZONE=""
     fi
     
     # Discover managed files
@@ -123,36 +132,102 @@ discover_installation() {
     return 0
 }
 
-# Discover all managed files and check their status
+# Discover all managed files and check their status.
+# Recognises both layouts:
+#   * 2.x — /usr/share/zoneinfo/Canadian/* (or $HOME/.tzinfo/Canadian/*)
+#   * 1.x — /usr/local/share/zoneinfo/America/* (or $HOME/.tzinfo/America/*)
+# The migration op-list chooses which layout to move to. We treat a
+# matching 2.x file as healthy and a 1.x-only installation as
+# "upgrade_available."
 discover_managed_files() {
     local zoneinfo_dir="$1"
     local script_dir="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)}"
     local config_file="${script_dir}/zones.conf"
-    
+
     MANAGED_FILES=()
     MISSING_FILES=()
     CORRUPTED_FILES=()
-    
+    LEGACY_FILES_PRESENT=0
+    LEGACY_HEALTHY=1
+    LEGACY_FILES_COUNT=0
+    LEGACY_FILES_MISSING=0
+    CURRENT_LAYOUT_FILES=0
+
     if [[ ! -f "$config_file" ]]; then
         return 0
     fi
-    
-    # NOTE: use explicit `if` blocks, never `[[ … ]] && continue`. A failing test
-    # in an AND-OR list returns non-zero, which under `set -e` aborts the enclosing
-    # function and silently leaves MANAGED_FILES empty.
-    while IFS='|' read -r iana_zone _rest; do
+
+    # zones.conf is now `IANA|CUSTOM|...` pipe-separated; walk with 6 fields.
+    # Older 5-field rows (pre-2.x) will land IANA in field 1 and IANA_ABBREV
+    # in field 2; that's still fine because we only use field 1 for legacy
+    # lookups, and we skip custom-id discovery when field 2 doesn't look
+    # like a Canadian/* identifier.
+    while IFS='|' read -r iana_zone field2 _rest; do
         if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
         if [[ -z "$iana_zone" ]]; then continue; fi
 
-        local target_file="${zoneinfo_dir}/${iana_zone}"
-        MANAGED_FILES+=("$target_file")
+        # 2.x primary file: <base>/<custom_id>
+        if [[ "$field2" == Canadian/* ]]; then
+            local current_file="${zoneinfo_dir}/${field2}"
+            MANAGED_FILES+=("$current_file")
+            if [[ ! -f "$current_file" ]]; then
+                MISSING_FILES+=("$current_file")
+            else
+                CURRENT_LAYOUT_FILES=$((CURRENT_LAYOUT_FILES + 1))
+                if ! validate_tzif_file "$current_file"; then
+                    CORRUPTED_FILES+=("$current_file")
+                fi
+            fi
+        fi
 
-        if [[ ! -f "$target_file" ]]; then
-            MISSING_FILES+=("$target_file")
-        elif ! validate_tzif_file "$target_file"; then
-            CORRUPTED_FILES+=("$target_file")
+        # 1.x legacy file — only probe the ACTUAL legacy base for this
+        # scope. If we're inspecting /usr/share/zoneinfo, the 1.x files
+        # are at /usr/local/share/zoneinfo. If we're inspecting
+        # ~/.tzinfo, they're in the same directory tree. Probing outside
+        # the caller-supplied base would leak host state into a fixture.
+        local legacy_candidates=(
+            "${zoneinfo_dir}/${iana_zone}"
+        )
+        if [[ "$zoneinfo_dir" == /usr/share/zoneinfo* ]]; then
+            legacy_candidates+=(
+                "/usr/local/share/zoneinfo/${iana_zone}"
+            )
+        fi
+        local row_legacy_found=0
+        for legacy in "${legacy_candidates[@]}"; do
+            if [[ -f "$legacy" ]]; then
+                LEGACY_FILES_PRESENT=1
+                LEGACY_FILES_COUNT=$((LEGACY_FILES_COUNT + 1))
+                row_legacy_found=1
+                # A corrupt 1.x file must fail health. Do NOT reset
+                # LEGACY_HEALTHY back to 1 on subsequent rows.
+                if ! validate_tzif_file "$legacy"; then
+                    LEGACY_HEALTHY=0
+                    CORRUPTED_FILES+=("$legacy")
+                fi
+                break
+            fi
+        done
+        if [[ "$row_legacy_found" == "0" && "${INSTALLED_VERSION:-}" == "1.0.0" ]]; then
+            # Under a strict 1.x install, every source zone should have a
+            # legacy file. Missing one is a real defect.
+            LEGACY_FILES_MISSING=$((LEGACY_FILES_MISSING + 1))
         fi
     done < "$config_file"
+    return 0
+}
+
+# Count source zones declared in zones.conf
+_count_zones_conf_sources() {
+    local script_dir="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+    local cfg="${script_dir}/zones.conf"
+    if [[ ! -f "$cfg" ]]; then echo 0; return; fi
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        { n++ }
+        END { print n+0 }
+    ' "$cfg"
 }
 
 # Validate overall installation health
@@ -171,18 +246,27 @@ validate_installation_health() {
                 return 0
             fi
         fi
-        
+
         # Must have selected zone (for system-wide)
         if [[ "$INSTALLATION_MODE" == "system" && -z "$SELECTED_ZONE" ]]; then
             return 0
         fi
-        
-        # Check if all managed files exist and are valid
-        if [[ ${#MISSING_FILES[@]} -gt 0 ]] || [[ ${#CORRUPTED_FILES[@]} -gt 0 ]]; then
+
+        # A legacy installation's own layout is America/*. Its health is
+        # defined by the legacy files being present and uncorrupted — we
+        # cannot use MISSING_FILES because that list is populated with the
+        # 2.x target files that a legacy install never had by definition.
+        if [[ "${LEGACY_FILES_PRESENT:-0}" != "1" ]]; then
             return 0
         fi
-        
-        # Legacy installation is healthy if all files are present and valid
+        if [[ "${LEGACY_HEALTHY:-1}" != "1" ]]; then
+            return 0
+        fi
+        if [[ ${#CORRUPTED_FILES[@]} -gt 0 ]]; then
+            return 0
+        fi
+
+        # Legacy installation is healthy if legacy files exist and are valid
         INSTALLATION_HEALTHY=true
         return 0
     fi
@@ -192,10 +276,28 @@ validate_installation_health() {
     if [[ -z "$SCHEMA_VERSION" ]]; then
         return 0
     fi
-    
-    # File integrity is required for every mode
-    if [[ ${#MISSING_FILES[@]} -gt 0 ]] || [[ ${#CORRUPTED_FILES[@]} -gt 0 ]]; then
-        return 0
+
+    # Schema 1 (1.x layout): the "current" files are America/* patches
+    # in the legacy base; schema 2 uses Canadian/* under the system base.
+    # Missing Canadian/* is only a health failure if schema_version=2 —
+    # for 1.x installs we look at the legacy files instead.
+    if [[ "$SCHEMA_VERSION" == "1" ]]; then
+        # A schema-1 install is only healthy when all six source zones
+        # still have their legacy files. Anything short is a defect
+        # requiring repair, not a migration candidate.
+        local expected_sources
+        expected_sources=$(_count_zones_conf_sources)
+        if [[ "${LEGACY_FILES_COUNT:-0}" -lt "$expected_sources" ]]; then
+            return 0
+        fi
+        if [[ "${LEGACY_HEALTHY:-1}" != "1" ]]; then
+            return 0
+        fi
+    else
+        # File integrity is required for every mode at schema 2+
+        if [[ ${#MISSING_FILES[@]} -gt 0 ]] || [[ ${#CORRUPTED_FILES[@]} -gt 0 ]]; then
+            return 0
+        fi
     fi
     
     # Selected zone is only meaningful for system-wide installs (drives the symlink)
@@ -242,6 +344,11 @@ determine_upgrade_action() {
                 break
             fi
         done
+    fi
+    # A 1.x installation has no Canadian/* files yet — it still counts
+    # as installed as long as its patched America/* files exist.
+    if [[ "$has_files" == "false" && "${LEGACY_FILES_PRESENT:-0}" == "1" ]]; then
+        has_files=true
     fi
     
     # Check if config exists (even without version info)
@@ -309,41 +416,80 @@ print(data.get('minimum_version', '0.8.0'))
     fi
 }
 
-# Find a valid upgrade path between versions
+# Find a valid upgrade path between versions. Walks the migrations graph
+# transitively (0.9.0 → 1.0.0 → 2.0.0), concatenating op-lists in order.
 find_upgrade_path() {
     local from_version="$1"
     local to_version="$2"
     local migrations_file="$3"
-    
+
     UPGRADE_PATH=""
-    
+
     if [[ ! -f "$migrations_file" ]]; then
         return 1
     fi
-    
-    # Parse migrations.json to find path
-    # Using python for JSON parsing
-    local path
-    path=$(python3 -c "
-import json
-import sys
 
-with open('$migrations_file', 'r') as f:
+    local path
+    path=$(python3 - "$migrations_file" "$from_version" "$to_version" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
     data = json.load(f)
 
-from_ver = '$from_version'
-to_ver = '$to_version'
+src, dst = sys.argv[2], sys.argv[3]
 
-# Find direct migration
-for migration in data.get('migrations', []):
-    if migration.get('from_version') == from_ver and migration.get('to_version') == to_ver:
-        print(json.dumps(migration))
-        sys.exit(0)
+# Graph: migrations keyed by from_version
+edges = {}
+for m in data.get('migrations', []):
+    edges.setdefault(m['from_version'], []).append(m)
 
-# No direct path found
-sys.exit(1)
-" 2>/dev/null) || return 1
-    
+# BFS: state is (version_path, migration_path). We pop the pair, not two
+# independent lists.
+from collections import deque
+queue = deque([([src], [])])
+visited = {src}
+target_ops = None
+
+while queue:
+    vpath, ops = queue.popleft()
+    cur = vpath[-1]
+    if cur == dst and len(vpath) > 1:
+        target_ops = ops
+        break
+    for m in edges.get(cur, []):
+        nxt = m.get('to_version') if isinstance(m, dict) else None
+        if not nxt or nxt in visited:
+            continue
+        visited.add(nxt)
+        queue.append((vpath + [nxt], ops + [m]))
+
+if target_ops is None:
+    sys.exit(1)
+
+# Merge multi-hop migration into a single virtual migration
+merged = {
+    'from_version': src,
+    'to_version':   dst,
+    'description':  ' → '.join([src] + [m['to_version'] for m in target_ops]),
+    'operations':   [],
+    'schema_changes': [],
+    'file_changes': [],
+    'validation':   [],
+    'rollback':     [],
+}
+for hop in target_ops:
+    if not isinstance(hop, dict):
+        continue
+    merged['operations'].extend(hop.get('operations', []))
+    merged['schema_changes'].extend(hop.get('schema_changes', []))
+    merged['file_changes'].extend(hop.get('file_changes', []))
+    merged['validation'].extend(hop.get('validation', []))
+    merged['rollback'].extend(hop.get('rollback', []))
+
+print(json.dumps(merged))
+PY
+) || return 1
+
     UPGRADE_PATH="$path"
     return 0
 }
@@ -506,23 +652,43 @@ create_upgrade_backup() {
         cp -r "$state_dir" "${backup_dir}/state"
     fi
     
-    # Backup timezone files - preserve relative path structure
+    # Backup timezone files - preserve relative path structure.
+    # We cover BOTH layouts the migration touches:
+    #   1.x sources at ${legacy_base}/America/<City>
+    #   2.x targets at ${zoneinfo_dir}/Canadian/<ABBR> (if any exist yet)
+    # A rollback during a 1.x → 2.x migration needs both.
+    local legacy
+    case "$zoneinfo_dir" in
+        /usr/share/zoneinfo*)  legacy="/usr/local/share/zoneinfo" ;;
+        *)                     legacy="${HOME:-/tmp}/.tzinfo" ;;
+    esac
+    local script_dir="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    if [[ -f "$script_dir/zones.conf" ]]; then
+        while IFS='|' read -r iana_zone _rest; do
+            case "$iana_zone" in ''|\#*) continue ;; esac
+            local cand
+            # Legacy patched America/<City>
+            for cand in "${legacy}/${iana_zone}" "${zoneinfo_dir}/${iana_zone}"; do
+                if [[ -f "$cand" ]]; then
+                    local rel="${cand#${legacy}/}"
+                    local bpath="${backup_dir}/legacy-zoneinfo/${rel}"
+                    mkdir -p "$(dirname "$bpath")"
+                    cp "$cand" "$bpath"
+                    break
+                fi
+            done
+        done < "$script_dir/zones.conf"
+    fi
+    # 2.x Canadian/* files (usually missing at pre-migration time)
     for file in "${MANAGED_FILES[@]}"; do
         if [[ -f "$file" ]]; then
-            # Get relative path from zoneinfo_dir
             local rel_path="${file#$zoneinfo_dir/}"
             local backup_path="${backup_dir}/zoneinfo/${rel_path}"
-            local backup_dir_path
-            backup_dir_path=$(dirname "$backup_path")
-            
-            # Create parent directories
-            mkdir -p "$backup_dir_path"
-            
-            # Copy file
+            mkdir -p "$(dirname "$backup_path")"
             cp "$file" "$backup_path"
         fi
     done
-    
+
     echo "$backup_dir"
 }
 
@@ -532,7 +698,7 @@ restore_upgrade_backup() {
     local zoneinfo_dir="$2"
     local config_path="$3"
     local state_dir="$4"
-    
+
     # Restore configuration
     if [[ -f "${backup_dir}/config" ]]; then
         cp "${backup_dir}/config" "$config_path"
@@ -548,20 +714,47 @@ restore_upgrade_backup() {
     if [[ -d "${backup_dir}/zoneinfo" ]]; then
         # Find all files in backup and restore them to their relative positions
         while IFS= read -r -d '' backup_file; do
-            # Get relative path from backup zoneinfo dir
             local rel_path="${backup_file#${backup_dir}/zoneinfo/}"
             local restore_path="${zoneinfo_dir}/${rel_path}"
             local restore_dir_path
             restore_dir_path=$(dirname "$restore_path")
-            
+
             # Create parent directories if needed
             mkdir -p "$restore_dir_path"
-            
+
             # Copy file back
             cp "$backup_file" "$restore_path"
         done < <(find "${backup_dir}/zoneinfo" -type f -print0)
     fi
-    
+
+    # Restore the pre-migration legacy America/<City> files, so a 1.x
+    # install is put back exactly as it was.
+    if [[ -d "${backup_dir}/legacy-zoneinfo" ]]; then
+        local legacy_base
+        case "$zoneinfo_dir" in
+            /usr/share/zoneinfo*)  legacy_base="/usr/local/share/zoneinfo" ;;
+            *)                     legacy_base="${HOME:-/tmp}/.tzinfo" ;;
+        esac
+        while IFS= read -r -d '' backup_file; do
+            local rel="${backup_file#${backup_dir}/legacy-zoneinfo/}"
+            local restore="${legacy_base}/${rel}"
+            mkdir -p "$(dirname "$restore")"
+            cp "$backup_file" "$restore"
+        done < <(find "${backup_dir}/legacy-zoneinfo" -type f -print0)
+    fi
+
+    # Delete any Canadian/* files that were created by the migration
+    # (they weren't in the pre-migration backup).
+    if [[ -d "${zoneinfo_dir}/Canadian" ]]; then
+        local had_canadian_in_backup=0
+        if [[ -d "${backup_dir}/zoneinfo/Canadian" ]]; then
+            had_canadian_in_backup=1
+        fi
+        if [[ "$had_canadian_in_backup" == "0" ]]; then
+            rm -rf -- "${zoneinfo_dir}/Canadian" 2>/dev/null || true
+        fi
+    fi
+
     return 0
 }
 
@@ -570,9 +763,246 @@ restore_upgrade_backup() {
 _derive_install_mode() {
     local zoneinfo_dir="$1"
     case "$zoneinfo_dir" in
-        /usr/local/share/zoneinfo*) echo "system" ;;
+        /usr/share/zoneinfo|/usr/local/share/zoneinfo*) echo "system" ;;
         *) echo "user" ;;
     esac
+}
+
+# ============================================================================
+# 1.x → 2.x migration operation helpers
+# ============================================================================
+# These implement the four new op types the 1.x→2.x migration entry declares.
+# Each is transactional-safe: the surrounding execute_upgrade() takes a full
+# backup before dispatching, and rolls back on any non-zero return.
+
+# Derive the legacy zoneinfo_dir for a given scope. The 1.x installer used
+# /usr/local/share/zoneinfo for system-scope and $HOME/.tzinfo for
+# user-scope, both containing patched America/<City> files.
+_legacy_zoneinfo_dir() {
+    local zoneinfo_dir="$1"
+    case "$zoneinfo_dir" in
+        /usr/share/zoneinfo*)  echo "/usr/local/share/zoneinfo" ;;
+        *)                     echo "${HOME:-/tmp}/.tzinfo" ;;
+    esac
+}
+
+# Locate the 2.x repo source directory (this is where install.sh ran from,
+# so zones.conf and lib/custom_zones.sh live nearby).
+_migration_source_dir() {
+    if [[ -n "${SCRIPT_DIR:-}" ]] && [[ -f "${SCRIPT_DIR}/zones.conf" ]]; then
+        echo "$SCRIPT_DIR"
+    elif [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        # Fall back to the library's parent directory.
+        (cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)
+    fi
+}
+
+# 1. Generate every custom Canadian/* identifier from its IANA source.
+_migrate_op_generate_custom_zones() {
+    local zoneinfo_dir="$1" state_dir="$2" config_path="$3"
+    local src
+    src="$(_migration_source_dir)"
+    if [[ -z "$src" ]] || [[ ! -f "$src/lib/custom_zones.sh" ]] \
+       || [[ ! -f "$src/zones.conf" ]]; then
+        error "Cannot locate zones.conf or lib/custom_zones.sh for migration"
+        return 1
+    fi
+    # The custom_zones library must be loaded (it isn't in a fresh
+    # subprocess when install.sh --upgrade runs from an old layout that
+    # predates the library file).
+    if ! type custom_zones_install >/dev/null 2>&1; then
+        # shellcheck source=/dev/null
+        source "$src/lib/custom_zones.sh"
+    fi
+
+    local patcher="$src/lib/patch_tzif.py"
+    local zones_conf="$src/zones.conf"
+    local parsed
+    parsed="$(custom_zones_parse_file "$zones_conf")" || {
+        error "zones.conf validation failed during migration"
+        return 1
+    }
+
+    while IFS=$'\t' read -r iana_source custom_id iab oab _name _url; do
+        if [[ -z "$iana_source" ]]; then continue; fi
+        # custom_zones_install writes to whatever custom_zones_base_dir
+        # says; we must respect the destination scope.
+        if [[ "$zoneinfo_dir" == /usr/share/zoneinfo* ]]; then
+            custom_zones_install system "$iana_source" "$custom_id" "$iab" "$oab" "$patcher" || {
+                error "custom-zone generation failed for $custom_id"
+                return 1
+            }
+        else
+            custom_zones_install user "$iana_source" "$custom_id" "$iab" "$oab" "$patcher" || {
+                error "custom-zone generation failed for $custom_id"
+                return 1
+            }
+        fi
+    done <<< "$parsed"
+    return 0
+}
+
+# 2. Repoint /etc/localtime to the selected Canadian/* identifier.
+#    Only performed in system scope; user-scope leaves /etc/localtime
+#    alone and relies on TZ=<absolute-path> at the app level.
+_migrate_op_relink_localtime() {
+    local zoneinfo_dir="$1" state_dir="$2"
+    [[ "$zoneinfo_dir" == /usr/share/zoneinfo* ]] || return 0
+
+    # Derive the selected source: prefer the legacy selected-zone file,
+    # else the current /etc/localtime symlink target's IANA id, else the
+    # recorded original_timezone in config.
+    local selected_source=""
+    if [[ -f "${state_dir}/selected-zone" ]]; then
+        selected_source=$(<"${state_dir}/selected-zone")
+    fi
+    if [[ -z "$selected_source" && -L /etc/localtime ]]; then
+        local t
+        t=$(readlink -f /etc/localtime)
+        if [[ "$t" =~ /zoneinfo/(.*) ]]; then
+            selected_source="${BASH_REMATCH[1]}"
+        fi
+    fi
+    if [[ -z "$selected_source" ]]; then
+        # Read config_path? state_dir/config might not exist yet
+        warn "Migration cannot determine selected source zone; /etc/localtime unchanged"
+        return 0
+    fi
+
+    # Map the source IANA id to its custom id from zones.conf
+    local src_dir; src_dir="$(_migration_source_dir)"
+    if [[ -z "$src_dir" || ! -f "$src_dir/zones.conf" ]]; then
+        error "cannot locate zones.conf for localtime relink"
+        return 1
+    fi
+    local selected_custom=""
+    while IFS=$'\t' read -r iana_source custom_id _a _b _c _d; do
+        if [[ -z "$iana_source" ]]; then continue; fi
+        if [[ "$iana_source" == "$selected_source" ]]; then
+            selected_custom="$custom_id"
+            break
+        fi
+    done < <(custom_zones_parse_file "$src_dir/zones.conf")
+
+    if [[ -z "$selected_custom" ]]; then
+        warn "No custom identifier for source '$selected_source'; /etc/localtime unchanged"
+        return 0
+    fi
+
+    local target="${zoneinfo_dir}/${selected_custom}"
+    if [[ ! -f "$target" ]]; then
+        error "Custom zone $target missing after generate step"
+        return 1
+    fi
+    ln -sfn "$target" /etc/localtime
+    # Cache the pairing for later ops (update_state_model)
+    mkdir -p "$state_dir"
+    printf '%s\n' "$selected_source" > "${state_dir}/.migration-selected-source.tmp"
+    printf '%s\n' "$selected_custom" > "${state_dir}/.migration-selected-custom.tmp"
+    info "Repointed /etc/localtime → ${selected_custom}"
+}
+
+# 3. Migrate the state files to the 2.x two-field model, and bump
+#    schema_version in the config to 2.
+_migrate_op_update_state_model() {
+    local state_dir="$1" config_path="$2"
+    local selected_source selected_custom
+    selected_source=$(cat "${state_dir}/.migration-selected-source.tmp" 2>/dev/null \
+                      || cat "${state_dir}/selected-zone" 2>/dev/null || echo "")
+    selected_custom=$(cat "${state_dir}/.migration-selected-custom.tmp" 2>/dev/null || echo "")
+
+    # Derive the custom id from the source if we only have the source
+    if [[ -z "$selected_custom" && -n "$selected_source" ]]; then
+        local src_dir; src_dir="$(_migration_source_dir)"
+        if [[ -n "$src_dir" ]]; then
+            while IFS=$'\t' read -r iana_source custom_id _a _b _c _d; do
+                [[ "$iana_source" == "$selected_source" ]] && selected_custom="$custom_id" && break
+            done < <(custom_zones_parse_file "$src_dir/zones.conf")
+        fi
+    fi
+
+    mkdir -p "$state_dir"
+    local tmp
+    if [[ -n "$selected_source" ]]; then
+        tmp="${state_dir}/selected-source-zone.tmp.$$"
+        printf '%s\n' "$selected_source" > "$tmp"; mv -T "$tmp" "${state_dir}/selected-source-zone"
+    fi
+    if [[ -n "$selected_custom" ]]; then
+        tmp="${state_dir}/selected-custom-zone.tmp.$$"
+        printf '%s\n' "$selected_custom" > "$tmp"; mv -T "$tmp" "${state_dir}/selected-custom-zone"
+    fi
+
+    # Retire the legacy single-field selected-zone file
+    if [[ -f "${state_dir}/selected-zone" ]]; then
+        rm -f -- "${state_dir}/selected-zone"
+    fi
+    rm -f -- "${state_dir}/.migration-selected-source.tmp" \
+              "${state_dir}/.migration-selected-custom.tmp"
+
+    # Bump schema_version in the config file
+    if [[ -f "$config_path" ]]; then
+        if grep -q '^schema_version=' "$config_path"; then
+            sed -i "s/^schema_version=.*/schema_version=2/" "$config_path"
+        else
+            echo "schema_version=2" >> "$config_path"
+        fi
+    fi
+    return 0
+}
+
+# 4. Remove the 1.x leftover America/* files from the legacy zoneinfo
+#    directory. Only files whose abbreviation pool has been patched to
+#    one of our official abbreviations are deleted — the tzdata-adjacent
+#    originals at /usr/share/zoneinfo/America/ are never touched.
+_migrate_op_remove_legacy_zoneinfo() {
+    local zoneinfo_dir="$1"
+    local legacy
+    legacy="$(_legacy_zoneinfo_dir "$zoneinfo_dir")"
+    [[ -d "$legacy/America" ]] || return 0
+
+    local src_dir; src_dir="$(_migration_source_dir)"
+    [[ -n "$src_dir" && -f "$src_dir/zones.conf" ]] || return 0
+
+    while IFS=$'\t' read -r iana_source _custom_id iab oab _name _url; do
+        if [[ -z "$iana_source" ]]; then continue; fi
+        local f="${legacy}/${iana_source}"
+        if [[ ! -f "$f" ]]; then continue; fi
+
+        # Only delete when the pool's abbreviation for the post-switch
+        # era matches our OFFICIAL_ABBREV (i.e. it really is a shim file).
+        # Replace NULs with pipes so bash command substitution doesn't warn.
+        local pool
+        pool="$(python3 - "$f" <<'PY'
+import struct, sys
+try:
+    d=open(sys.argv[1],'rb').read()
+    if d[:4] != b'TZif': sys.exit(0)
+    c1=struct.unpack('>6I', d[20:44])
+    v1=44+c1[3]*4+c1[3]+c1[4]*6+c1[5]+c1[2]*12+c1[1]+c1[0]
+    if v1+44 > len(d) or d[v1:v1+4] != b'TZif': sys.exit(0)
+    c2=struct.unpack('>6I', d[v1+20:v1+44])
+    p=v1+44+c2[3]*8+c2[3]+c2[4]*6
+    sys.stdout.write(d[p:p+c2[5]].replace(b'\x00', b'|').decode('latin-1'))
+except Exception:
+    pass
+PY
+)"
+        # The pool was patched iff the OFFICIAL_ABBR is present and the
+        # IANA_ABBR is absent. This mirrors the check in uninstall.sh.
+        if [[ "$pool" == *"${oab}"* ]] && [[ "$pool" != *"${iab}"* ]]; then
+            rm -f -- "$f"
+            info "  removed 1.x leftover ${f}"
+        else
+            warn "  skipping ${f} (not a shim patch — pool has '${iab}', no '${oab}')"
+        fi
+    done < <(custom_zones_parse_file "$src_dir/zones.conf")
+
+    # Prune the empty America dir if we now emptied it.
+    if [[ -d "$legacy/America" ]] \
+       && [[ -z "$(ls -A "$legacy/America" 2>/dev/null)" ]]; then
+        rmdir "$legacy/America" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # Execute a single migration operation
@@ -695,6 +1125,19 @@ execute_migration_operation() {
             
             return 0
             ;;
+        generate_custom_zones)
+            _migrate_op_generate_custom_zones "$zoneinfo_dir" \
+                "$state_dir" "$config_path"
+            ;;
+        relink_localtime_to_custom)
+            _migrate_op_relink_localtime "$zoneinfo_dir" "$state_dir"
+            ;;
+        update_state_model)
+            _migrate_op_update_state_model "$state_dir" "$config_path"
+            ;;
+        remove_legacy_zoneinfo)
+            _migrate_op_remove_legacy_zoneinfo "$zoneinfo_dir"
+            ;;
         update_metadata)
             # Will be done in update_version_metadata
             return 0
@@ -757,22 +1200,29 @@ validate_post_upgrade() {
 update_version_metadata() {
     local config_path="$1"
     local current_release="$2"
-    
+
     if [[ ! -f "$config_path" ]]; then
         return 0
     fi
-    
-    # Update or add version fields
+
+    # Derive schema_version from the target release. 2.0.0+ uses the
+    # Canadian/* custom-identifier layout (schema 2). Anything earlier
+    # is the patched-America-in-place layout (schema 1).
+    local schema="1"
+    case "$current_release" in
+        2.*|3.*|4.*) schema="2" ;;
+    esac
+
     if grep -q "^installed_version=" "$config_path" 2>/dev/null; then
         sed -i "s/^installed_version=.*/installed_version=${current_release}/" "$config_path"
     else
         echo "installed_version=${current_release}" >> "$config_path"
     fi
-    
+
     if grep -q "^schema_version=" "$config_path" 2>/dev/null; then
-        sed -i "s/^schema_version=.*/schema_version=1/" "$config_path"
+        sed -i "s/^schema_version=.*/schema_version=${schema}/" "$config_path"
     else
-        echo "schema_version=1" >> "$config_path"
+        echo "schema_version=${schema}" >> "$config_path"
     fi
 }
 

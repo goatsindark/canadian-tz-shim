@@ -88,35 +88,57 @@ if [[ "$TEST_MODE" == "user" ]]; then
     if ! bash "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1; then
         fail "Bootstrap install.sh failed in sandbox HOME=$HOME"
     fi
-    if [[ ! -f "$ZONEINFO_DIR/America/Vancouver" ]]; then
-        fail "Bootstrap did not create patched timezone files in $ZONEINFO_DIR"
+    # The new architecture installs custom Canadian/* zones under ~/.tzinfo/.
+    if [[ ! -f "$ZONEINFO_DIR/Canadian/PCT" ]]; then
+        fail "Bootstrap did not create custom Canadian/PCT in $ZONEINFO_DIR"
     fi
-    pass "Installed into sandbox: $ZONEINFO_DIR"
+    pass "Installed custom zones into sandbox: $ZONEINFO_DIR/Canadian/"
 else
     info "System mode: expects an existing system-wide installation"
-    if [[ ! -f "$ZONEINFO_DIR/America/Vancouver" ]]; then
-        fail "No system-wide installation found at $ZONEINFO_DIR (run: sudo ./install.sh)"
+    if [[ ! -f "$ZONEINFO_DIR/Canadian/PCT" ]]; then
+        fail "No system-wide installation found at $ZONEINFO_DIR/Canadian/PCT (run: sudo ./install.sh)"
     fi
 fi
 echo ""
 
 # Test 1: Verify installation
 header "Test Group 1: Installation Verification"
-info "Test: Patched timezone files exist"
+info "Test: Custom Canadian/* timezone files exist for every zones.conf row"
 all_exist=true
-while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
+while IFS='|' read -r iana_zone custom_id iana_abbrev official_abbrev official_name reference_url; do
     [[ "$iana_zone" =~ ^#.*$ ]] && continue
     [[ -z "$iana_zone" ]] && continue
 
-    patched_zone="${ZONEINFO_DIR}/${iana_zone}"
-    if [[ ! -f "$patched_zone" ]]; then
-        fail "Patched timezone not found: $patched_zone"
+    target="${ZONEINFO_DIR}/${custom_id}"
+    if [[ ! -f "$target" ]]; then
+        fail "Custom timezone not found: $target"
         fail "Please run ./install.sh first."
     fi
 done < "$CONFIG_FILE"
 total_tests=$((total_tests + 1))
 passed_tests=$((passed_tests + 1))
-pass "All patched timezone files exist"
+pass "All custom Canadian/* timezone files exist"
+echo ""
+
+# Test 1b: Official IANA source files under /usr/share/zoneinfo remain untouched
+header "Test Group 1b: IANA sources unchanged"
+info "Test: /usr/share/zoneinfo/America/Vancouver still uses MST pool"
+if [[ -f /usr/share/zoneinfo/America/Vancouver ]]; then
+    pool_after=$(python3 -c "
+import struct
+d=open('/usr/share/zoneinfo/America/Vancouver','rb').read()
+c1=struct.unpack('>6I', d[20:44]); v1=44+c1[3]*4+c1[3]+c1[4]*6+c1[5]+c1[2]*12+c1[1]+c1[0]
+c2=struct.unpack('>6I', d[v1+20:v1+44])
+p=v1+44+c2[3]*8+c2[3]+c2[4]*6
+import sys; sys.stdout.write(d[p:p+c2[5]].decode('latin-1'))
+")
+    if [[ "$pool_after" == *"MST"* ]] && [[ "$pool_after" != *"PCT"* ]]; then
+        pass "America/Vancouver source untouched (still MST-only pool)"
+    else
+        fail "America/Vancouver source was modified! pool=$pool_after"
+    fi
+    total_tests=$((total_tests + 1)); passed_tests=$((passed_tests + 1))
+fi
 echo ""
 
 # Test 2: Verify state files
@@ -153,13 +175,13 @@ echo ""
 
 # Test 3: Verify timezone abbreviations for all zones
 header "Test Group 3: Timezone Abbreviation Tests"
-while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
+while IFS='|' read -r iana_zone custom_id iana_abbrev official_abbrev official_name reference_url; do
     [[ "$iana_zone" =~ ^#.*$ ]] && continue
     [[ -z "$iana_zone" ]] && continue
 
-    patched_zone="${ZONEINFO_DIR}/${iana_zone}"
+    patched_zone="${ZONEINFO_DIR}/${custom_id}"
 
-    header "Testing: $iana_zone ($official_name)"
+    header "Testing: ${custom_id} (source: $iana_zone, $official_name)"
 
     # Test: Date after transition should show official abbreviation
     total_tests=$((total_tests + 1))
@@ -313,15 +335,38 @@ fi
 
 # Test 5: Idempotency test
 header "Test Group 5: Idempotency Test"
-info "Test: Running install.sh again should skip already-patched zones"
+info "Test: Re-running install.sh does not alter the installed custom zones"
+# Snapshot the hash of one installed custom file
+sample_custom="Canadian/PCT"
+sample_path="${ZONEINFO_DIR}/${sample_custom}"
+hash_before=$(sha256sum "$sample_path" | awk '{print $1}')
+
 output=$(bash "${SCRIPT_DIR}/install.sh" 2>&1 || true)
-if echo "$output" | grep -q "SKIP.*already patched"; then
-    total_tests=$((total_tests + 1))
+
+hash_after=$(sha256sum "$sample_path" | awk '{print $1}')
+total_tests=$((total_tests + 1))
+if [[ "$hash_before" == "$hash_after" ]]; then
     passed_tests=$((passed_tests + 1))
-    pass "Install script correctly detects already-patched zones"
+    pass "Install idempotent — custom zone file unchanged"
 else
-    total_tests=$((total_tests + 1))
-    fail "Install script did not detect already-patched zones"
+    fail "Install changed ${sample_custom}: $hash_before → $hash_after"
+fi
+
+# Also: manifest hash must still match the file (ownership preserved)
+total_tests=$((total_tests + 1))
+manifest_path=$( [ "$TEST_MODE" == "user" ] \
+                  && echo "$HOME/.local/state/canadian-tz-shim/custom-zones.json" \
+                  || echo "/var/lib/canadian-tz-shim/custom-zones.json" )
+recorded=$(python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d['zones']['${sample_custom}']['sha256'])
+" "$manifest_path")
+if [[ "$recorded" == "$hash_after" ]]; then
+    passed_tests=$((passed_tests + 1))
+    pass "Manifest hash updated and matches installed file"
+else
+    fail "Manifest hash drift: recorded=$recorded actual=$hash_after"
 fi
 echo ""
 

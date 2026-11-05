@@ -13,7 +13,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-SUITES=(test.sh test-regressions.sh test-upgrade.sh test-uninstall-edge-cases.sh)
+SUITES=(test.sh test-regressions.sh test-upgrade.sh test-uninstall-edge-cases.sh
+        test-custom-zones.sh test-migration.sh)
 
 TOTAL=0
 PASSED=0

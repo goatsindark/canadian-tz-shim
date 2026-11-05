@@ -1,8 +1,114 @@
 {
-  "version": "1.0",
-  "current_release": "1.0.0",
-  "schema_version": "1",
+  "version": "2.0",
+  "current_release": "2.0.0",
+  "schema_version": "2",
   "migrations": [
+    {
+      "from_version": "1.0.0",
+      "to_version": "2.0.0",
+      "description": "Migrate from patched-America-in-place (1.x) to custom Canadian/* identifiers (2.x). Never modifies official IANA sources; the 1.x leftover files are removed only if their abbreviation pool matches a shim patch signature.",
+      "schema_changes": [
+        {
+          "type": "update_field",
+          "file": "tzshim.conf",
+          "field": "schema_version",
+          "value": "2"
+        },
+        {
+          "type": "update_field",
+          "file": "tzshim.conf",
+          "field": "installed_version",
+          "value": "2.0.0"
+        }
+      ],
+      "file_changes": [
+        {
+          "type": "add_field",
+          "path": "selected-source-zone",
+          "action": "create"
+        },
+        {
+          "type": "add_field",
+          "path": "selected-custom-zone",
+          "action": "create"
+        },
+        {
+          "type": "add_field",
+          "path": "custom-zones.json",
+          "action": "create"
+        }
+      ],
+      "operations": [
+        {
+          "type": "backup_metadata",
+          "description": "Backup existing configuration"
+        },
+        {
+          "type": "update_scripts",
+          "description": "Update lib/patch_tzif.py, lib/reapply.sh, lib/upgrade.sh, and add lib/custom_zones.sh"
+        },
+        {
+          "type": "generate_custom_zones",
+          "description": "Generate Canadian/* TZif files under the destination zoneinfo base"
+        },
+        {
+          "type": "relink_localtime_to_custom",
+          "description": "Repoint /etc/localtime from America/* (or /usr/local/share/zoneinfo/America/*) to the Canadian/* custom identifier"
+        },
+        {
+          "type": "update_state_model",
+          "description": "Write selected-source-zone and selected-custom-zone; retire selected-zone; bump schema_version"
+        },
+        {
+          "type": "install_systemd",
+          "description": "Refresh systemd path + service units (system scope only)"
+        },
+        {
+          "type": "remove_legacy_zoneinfo",
+          "description": "Remove 1.x leftover America/* files only when their abbreviation pool proves they were shim patches"
+        },
+        {
+          "type": "validate_installation",
+          "description": "Verify every Canadian/* file is structurally valid TZif"
+        }
+      ],
+      "validation": [
+        {
+          "type": "check_files",
+          "description": "Verify all Canadian/* files exist"
+        },
+        {
+          "type": "check_abbreviations",
+          "description": "Verify post-switch abbreviations match zones.conf"
+        },
+        {
+          "type": "check_offsets",
+          "description": "Verify UTC offsets preserved"
+        },
+        {
+          "type": "check_localtime_symlink",
+          "description": "Verify /etc/localtime resolves to a Canadian/* identifier"
+        }
+      ],
+      "rollback": [
+        {
+          "type": "restore_metadata",
+          "description": "Restore backed up configuration"
+        },
+        {
+          "type": "restore_scripts",
+          "description": "Restore previous script versions"
+        },
+        {
+          "type": "restore_localtime",
+          "description": "Re-point /etc/localtime back to its pre-upgrade target"
+        },
+        {
+          "type": "remove_new_custom_zones",
+          "description": "Delete Canadian/* files that this migration just created"
+        }
+      ]
+    },
     {
       "from_version": "0.9.0",
       "to_version": "1.0.0",

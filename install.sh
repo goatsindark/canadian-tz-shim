@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
-# Canadian Timezone Shim - Install script with upgrade support
-# Patches Canadian timezone files to use official provincial/territorial abbreviations
+# Canadian Timezone Shim — Install script (v2, custom-zone architecture)
+#
+# The shim never modifies any official IANA TZif file. Instead it
+# generates custom TZif files under the "Canadian/" namespace in the
+# system zoneinfo tree, validates them against fixed historical dates,
+# appends one narrow, idempotent, reversible registration line per
+# custom identifier to zone.tab / zone1970.tab (so Qt's country() and
+# comment() resolve), and points /etc/localtime at the selected custom
+# zone. Every added line and every installed file is recorded in the
+# ownership manifest so uninstall removes exactly what this project
+# added and nothing else.
+#
+# Official IANA identifiers such as America/Vancouver are read as the
+# *source* for a custom identifier such as Canadian/PCT. The source file
+# is never written to. See zones.conf for the mapping.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/zones.conf"
 MIGRATIONS_FILE="${SCRIPT_DIR}/migrations.json"
-CURRENT_VERSION="1.0.0"
+CUSTOM_ZONES_LIB="${SCRIPT_DIR}/lib/custom_zones.sh"
+PATCHER="${SCRIPT_DIR}/lib/patch_tzif.py"
+CURRENT_VERSION="2.0.0"
+CONFIG_SCHEMA_VERSION="2"
 
 # Parse command-line arguments
 UPGRADE_MODE=false
@@ -16,41 +32,33 @@ SHOW_HELP=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --upgrade)
-            UPGRADE_MODE=true
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        --help|-h)
-            SHOW_HELP=true
-            shift
-            ;;
-        *)
-            echo "Unknown option: $1" >&2
-            exit 1
-            ;;
+        --upgrade)  UPGRADE_MODE=true; shift ;;
+        --dry-run)  DRY_RUN=true;         shift ;;
+        --help|-h)  SHOW_HELP=true;       shift ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-# Show help if requested
 if [[ "$SHOW_HELP" == "true" ]]; then
     cat <<EOF
 Usage: $0 [OPTIONS]
 
-Canadian Timezone Shim Installer
+Canadian Timezone Shim Installer (v2)
 
 Options:
-  --upgrade          Upgrade existing installation to current version
+  --upgrade          Upgrade or repair an existing installation
   --dry-run          Show what would be done without making changes
   --help, -h         Show this help message
 
-Examples:
-  $0                          # Fresh installation
-  $0 --upgrade                # Upgrade existing installation
-  $0 --upgrade --dry-run      # Show upgrade plan without executing
+The installer generates custom "Canadian/<ABBR>" TZif identifiers under
+/usr/share/zoneinfo/ (system-wide) or ~/.tzinfo/ (user-level), each built
+from its IANA source file.  /etc/localtime is pointed at the selected
+custom zone.  The official /usr/share/zoneinfo/America/* files are never
+modified.  In system scope the installer also appends one narrow,
+reversible registration line per custom identifier to
+/usr/share/zoneinfo/zone.tab and zone1970.tab so Qt's
+QTimeZone::country() / comment() resolve; uninstall removes exactly the
+lines this project added and nothing else.
 
 EOF
     exit 0
@@ -58,187 +66,103 @@ fi
 
 # Determine installation scope
 if [[ $EUID -eq 0 ]]; then
-    # Running as root: install system-wide
-    ZONEINFO_DIR="/usr/local/share/zoneinfo"
-    SYSTEM_WIDE=true
+    SCOPE="system"
+    ZONEINFO_DIR="/usr/share/zoneinfo"          # base for /usr/share/zoneinfo/Canadian/*
     STATE_DIR="/var/lib/canadian-tz-shim"
     CONFIG_PATH="/etc/tzshim.conf"
 else
-    # Running as user: install to home directory
+    SCOPE="user"
     ZONEINFO_DIR="${HOME}/.tzinfo"
-    SYSTEM_WIDE=false
     STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
     CONFIG_PATH="${HOME}/.config/tzshim.conf"
 fi
 
+# Load custom-zone library
+if [[ ! -f "$CUSTOM_ZONES_LIB" ]]; then
+    echo "ERROR: lib/custom_zones.sh missing — cannot install" >&2
+    exit 1
+fi
+# shellcheck source=lib/custom_zones.sh
+source "$CUSTOM_ZONES_LIB"
+
 # Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+BOLD='\033[1m'; NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+header(){ echo -e "${BLUE}$*${NC}"; }
 
-info() {
-    echo -e "${GREEN}[INFO]${NC} $*"
-}
+# ============================================================================
+# Upgrade path (unchanged behaviour, but with a migration step 1.x → 2.x)
+# ============================================================================
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
-}
-
-header() {
-    echo -e "${BLUE}$*${NC}"
-}
-
-# Source upgrade library if in upgrade mode
 if [[ "$UPGRADE_MODE" == "true" ]]; then
     if [[ ! -f "${SCRIPT_DIR}/lib/upgrade.sh" ]]; then
-        error "Upgrade library not found: ${SCRIPT_DIR}/lib/upgrade.sh"
+        error "Upgrade library missing: lib/upgrade.sh"
         exit 1
     fi
+    # shellcheck source=lib/upgrade.sh
     source "${SCRIPT_DIR}/lib/upgrade.sh"
+    # Load the custom-zones library so the migration's generate_custom_zones
+    # operation is available in-process.
+    if [[ ! -f "${SCRIPT_DIR}/lib/custom_zones.sh" ]]; then
+        error "Upgrade requires lib/custom_zones.sh"
+        exit 1
+    fi
+    # shellcheck source=lib/custom_zones.sh
+    source "${SCRIPT_DIR}/lib/custom_zones.sh"
+
+    discover_installation "$([[ "$SCOPE" == "system" ]])" \
+        "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH"
+    determine_upgrade_action "$CURRENT_VERSION" "$MIGRATIONS_FILE"
+    case "$UPGRADE_STATE" in
+        not_installed) error "No existing installation found"; exit 1 ;;
+        current)       info "Already up to date at $INSTALLED_VERSION"; exit 0 ;;
+        unsupported)   error "Unsupported installed version: $INSTALLED_VERSION"; exit 1 ;;
+        *) ;;
+    esac
+    if execute_upgrade "$DRY_RUN" "$ZONEINFO_DIR" "$STATE_DIR" \
+                      "$CONFIG_PATH" "$MIGRATIONS_FILE"; then
+        info "Upgrade completed."
+        exit 0
+    else
+        error "Upgrade failed; previous state preserved."
+        exit 1
+    fi
 fi
 
-# Check if config file exists
+# ============================================================================
+# Preflight: parse + validate zones.conf
+# ============================================================================
+
 if [[ ! -f "$CONFIG_FILE" ]]; then
     error "Configuration file not found: $CONFIG_FILE"
     exit 1
 fi
 
-# Check if zdump is available
-if ! command -v zdump &>/dev/null; then
-    error "zdump command not found. Please install tzdata package."
+if ! command -v python3 >/dev/null 2>&1; then
+    error "python3 is required (TZif patcher and manifest writer)"
     exit 1
 fi
 
-# ============================================================================
-# Upgrade Mode
-# ============================================================================
-
-if [[ "$UPGRADE_MODE" == "true" ]]; then
-    header "Canadian Timezone Shim - Upgrade Mode"
-    echo ""
-    
-    # Discover existing installation
-    info "Discovering existing installation..."
-    discover_installation "$SYSTEM_WIDE" "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH"
-    
-    # Report discovery results
-    report_installation_status
-    
-    # Determine upgrade action
-    info "Determining upgrade action..."
-    determine_upgrade_action "$CURRENT_VERSION" "$MIGRATIONS_FILE"
-    
-    # Report decision
-    report_upgrade_decision "$CURRENT_VERSION"
-    echo ""
-    
-    # Handle different states
-    case "$UPGRADE_STATE" in
-        "$UPGRADE_STATE_CURRENT")
-            info "Installation is current and healthy. No action needed."
-            exit 0
-            ;;
-        
-        "$UPGRADE_STATE_NOT_INSTALLED")
-            error "No existing installation found."
-            error "Use '$0' without --upgrade for fresh installation."
-            exit 1
-            ;;
-        
-        "$UPGRADE_STATE_AMBIGUOUS")
-            error "Cannot determine installation state reliably."
-            error "Manual intervention required."
-            error "Consider uninstalling and performing fresh installation."
-            exit 1
-            ;;
-        
-        "$UPGRADE_STATE_UNSUPPORTED")
-            error "No supported upgrade path from ${INSTALLED_VERSION} to ${CURRENT_VERSION}"
-            error "Manual intervention required."
-            exit 1
-            ;;
-        
-        "$UPGRADE_STATE_REPAIR_REQUIRED")
-            warn "Installation requires repair."
-            if [[ "$DRY_RUN" == "true" ]]; then
-                info "Dry run: Would repair installation"
-                exit 0
-            fi
-            # Execute repair
-            if execute_repair "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH"; then
-                info "Repair completed successfully!"
-                exit 0
-            else
-                error "Repair failed."
-                exit 1
-            fi
-            ;;
-        
-        "$UPGRADE_STATE_UPGRADE_AVAILABLE")
-            info "Upgrade available: ${INSTALLED_VERSION} → ${CURRENT_VERSION}"
-            if [[ "$DRY_RUN" == "true" ]]; then
-                info "Dry run: Would upgrade installation"
-                exit 0
-            fi
-            # Fall through to execute upgrade
-            ;;
-    esac
-    
-    # Execute upgrade
-    info "Executing upgrade..."
-    if execute_upgrade "$DRY_RUN" "$ZONEINFO_DIR" "$STATE_DIR" "$CONFIG_PATH" "$MIGRATIONS_FILE"; then
-        info "Upgrade completed successfully!"
-        info "Installation is now at version ${CURRENT_VERSION}"
-        exit 0
-    else
-        error "Upgrade failed."
-        exit 1
-    fi
+if ! ZONES_TSV="$(custom_zones_parse_file "$CONFIG_FILE" 2>&1)"; then
+    error "zones.conf failed validation:"
+    echo "$ZONES_TSV" >&2
+    exit 1
 fi
+ZONE_COUNT=$(echo "$ZONES_TSV" | wc -l)
+info "Parsed $ZONE_COUNT Canadian zones from $CONFIG_FILE"
 
 # ============================================================================
-# Normal Installation Mode
+# Timezone detection (system-wide)
 # ============================================================================
 
-header "Canadian Timezone Shim Installer"
-echo ""
-echo "This tool patches Canadian timezone files to use official provincial/territorial"
-echo "abbreviations instead of IANA's convention choices."
-echo ""
-
-if [[ "$SYSTEM_WIDE" == "true" ]]; then
-    echo "Installation mode: SYSTEM-WIDE (requires root)"
-    echo "Patched zones will be installed to: $ZONEINFO_DIR"
-    echo ""
-else
-    echo "Installation mode: USER-ONLY"
-    echo "Patched zones will be installed to: $ZONEINFO_DIR"
-    echo ""
-fi
-
-# Detect current timezone
-# Only accepts the canonical system zoneinfo directory (/usr/share/zoneinfo).
-# A /etc/localtime that points into any shim install directory is NOT an original
-# timezone - recording it would create self-referential restoration metadata.
 detect_current_timezone() {
     if [[ -L /etc/localtime ]]; then
         local target
         target=$(readlink -f /etc/localtime)
-        # Reject targets inside this install's dir and the system-wide shim dir
-        case "$target" in
-            "$ZONEINFO_DIR"/*|/usr/local/share/zoneinfo/*)
-                return 1
-                ;;
-        esac
-        # Extract zone name from the canonical system path
-        if [[ "$target" =~ ^/usr/share/zoneinfo/(.*) ]]; then
+        if [[ "$target" =~ /zoneinfo/(.*) ]]; then
             echo "${BASH_REMATCH[1]}"
             return 0
         fi
@@ -246,131 +170,52 @@ detect_current_timezone() {
     return 1
 }
 
-# Show menu for timezone selection
-# Display goes to /dev/tty (visible to user), return value goes to stdout
 show_timezone_menu() {
-    local zones=()
-    local names=()
-
-    while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
-        # Explicit `if` guards: `[[ … ]] && continue` returns non-zero when the test
-        # fails, which aborts this function under `set -e`.
-        if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
-        if [[ -z "$iana_zone" ]]; then continue; fi
-        zones+=("$iana_zone")
-        names+=("$official_name ($official_abbrev)")
-    done < "$CONFIG_FILE"
-
-    # All display output goes to /dev/tty so it's not captured by $()
-    echo "" >&2
-    echo "Select your timezone:" >&2
-    echo "" >&2
-    for i in "${!zones[@]}"; do
-        echo "  $((i+1))) ${zones[$i]} - ${names[$i]}" >&2
-    done
-    echo "" >&2
-
-    local choice=""
+    header "Select the timezone you want to activate:"
+    echo ""
+    local i=1
+    local sources=()
+    while IFS=$'\t' read -r src id _iab _oab name _url; do
+        printf "  %d) %s (%s)   →  custom id: %s\n" "$i" "$src" "$name" "$id"
+        sources+=("$src")
+        i=$((i + 1))
+    done <<< "$ZONES_TSV"
+    echo ""
+    local choice
     while true; do
-        read -r -p "Enter choice [1-${#zones[@]}]: " choice </dev/tty >&2
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#zones[@]} ]]; then
-            # Only the selection goes to stdout for capture
-            echo "${zones[$((choice-1))]}"
+        read -p "Enter choice [1-$i]: " -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= i )); then
+            printf '%s\n' "${sources[$((choice - 1))]}"
             return 0
         fi
-        echo "Invalid choice. Please enter a number between 1 and ${#zones[@]}." >&2
+        echo "Invalid choice."
     done
 }
 
-# Validate that a timezone identifier is in our config
-validate_zone() {
-    local zone="$1"
-    while IFS='|' read -r iana_zone _rest; do
-        # Explicit `if` guards so a failing test cannot abort this function under set -e
-        if [[ "$iana_zone" =~ ^#.*$ ]]; then continue; fi
-        if [[ -z "$iana_zone" ]]; then continue; fi
-        if [[ "$iana_zone" == "$zone" ]]; then
-            return 0
-        fi
-    done < "$CONFIG_FILE"
-    return 1
-}
-
-# Targeted binary patcher: patches only TZif abbreviation pools and POSIX footer
-# This is safer than global sed because it only modifies known abbreviation locations
-patch_tzif_file() {
-    local file="$1"
-    local old_abbrev="$2"
-    local new_abbrev="$3"
-
-    # Both must be exactly 3 bytes for safe replacement
-    if [[ ${#old_abbrev} -ne 3 ]] || [[ ${#new_abbrev} -ne 3 ]]; then
-        error "Abbreviations must be exactly 3 characters"
-        return 1
-    fi
-
-    # Use the external Python patcher script
-    local patcher_script="${SCRIPT_DIR}/lib/patch_tzif.py"
-    if [[ ! -f "$patcher_script" ]]; then
-        error "Patcher script not found: $patcher_script"
-        return 1
-    fi
-
-    python3 "$patcher_script" "$file" "$old_abbrev" "$new_abbrev" 2>/dev/null
-}
-
-# Verify a patched TZif file is structurally sound
-verify_tzif_integrity() {
-    local patched_file="$1"
-    local original_file="$2"
-
-    # Check file sizes match (equal-length replacement preserves size)
-    local patched_size original_size
-    patched_size=$(stat -c%s "$patched_file")
-    original_size=$(stat -c%s "$original_file")
-
-    if [[ "$patched_size" != "$original_size" ]]; then
-        error "File size changed: $original_size → $patched_size"
-        return 1
-    fi
-
-    # Use zdump to verify the file is still a valid timezone file
-    if ! zdump -v "$patched_file" &>/dev/null; then
-        error "zdump cannot parse patched file"
-        return 1
-    fi
-
-    return 0
-}
-
-# Determine which zone to activate (system-wide only)
-selected_zone=""
+selected_source_zone=""
 original_timezone=""
 original_timezone_path=""
-if [[ "$SYSTEM_WIDE" == "true" ]]; then
-    # Check if we already have saved original timezone metadata
+selected_custom_zone=""
+
+if [[ "$SCOPE" == "system" ]]; then
+    # Preserve original restoration metadata if we already have it.
     if [[ -f "$CONFIG_PATH" ]]; then
-        source "$CONFIG_PATH"
+        # shellcheck disable=SC1090
+        source "$CONFIG_PATH" || true
         original_timezone="${original_timezone:-}"
         original_timezone_path="${original_timezone_path:-}"
-
-        # Reject self-referential metadata written by older releases.
-        # original_timezone_path must not resolve inside the shim's own install dir.
         if [[ -n "$original_timezone_path" ]]; then
             case "$original_timezone_path" in
-                "$ZONEINFO_DIR"/*)
-                    warn "Discarding self-referential original_timezone_path from $CONFIG_PATH"
+                "$ZONEINFO_DIR"/Canadian/*|/usr/local/share/zoneinfo/*|"${HOME}/.tzinfo"/*)
+                    warn "Discarding self-referential original_timezone_path"
                     original_timezone_path=""
                     ;;
             esac
         fi
-
-        # original_timezone must name a real system zone
         if [[ -n "$original_timezone" && ! -f "/usr/share/zoneinfo/$original_timezone" ]]; then
-            warn "Discarding invalid original_timezone from $CONFIG_PATH: $original_timezone"
+            warn "Discarding invalid original_timezone: $original_timezone"
             original_timezone=""
         fi
-
         if [[ -n "$original_timezone" || -n "$original_timezone_path" ]]; then
             info "Preserving existing original timezone metadata"
         fi
@@ -378,356 +223,252 @@ if [[ "$SYSTEM_WIDE" == "true" ]]; then
 
     current_tz=$(detect_current_timezone || echo "")
 
-    # Check if current timezone matches one of our zones
+    # Match the current zone against either the IANA source or an already
+    # installed custom zone (upgrade idempotency).
     matched=false
-    while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
-        [[ "$iana_zone" =~ ^#.*$ ]] && continue
-        [[ -z "$iana_zone" ]] && continue
-
-        if [[ "$current_tz" == "$iana_zone" ]]; then
-            selected_zone="$iana_zone"
+    while IFS=$'\t' read -r src id _iab _oab name _url; do
+        if [[ "$current_tz" == "$src" ]] || [[ "$current_tz" == "$id" ]]; then
+            selected_source_zone="$src"
+            selected_custom_zone="$id"
             matched=true
-            info "Detected current timezone: $iana_zone ($official_name)"
+            info "Detected current timezone: $src ($name) → $id"
             break
         fi
-    done < "$CONFIG_FILE"
+    done <<< "$ZONES_TSV"
 
-    # If no match, show menu
     if [[ "$matched" == "false" ]]; then
         if [[ -n "$current_tz" ]]; then
             warn "Current timezone ($current_tz) is not in the Canadian shim list."
         else
             warn "Could not detect current timezone."
         fi
-        selected_zone=$(show_timezone_menu) || exit 1
-
-        # Validate the selection
-        if ! validate_zone "$selected_zone"; then
-            error "Invalid timezone selection: $selected_zone"
-            exit 1
-        fi
+        selected_source_zone=$(show_timezone_menu) || exit 1
+        # Resolve its custom id
+        while IFS=$'\t' read -r src id _a _b _c _d; do
+            if [[ "$src" == "$selected_source_zone" ]]; then
+                selected_custom_zone="$id"
+                break
+            fi
+        done <<< "$ZONES_TSV"
     fi
 
-    # Only save original timezone if we don't already have it
+    if [[ -z "$selected_custom_zone" ]]; then
+        error "Selected source has no custom id mapping"
+        exit 1
+    fi
+
+    # Record the original timezone if we haven't yet.
     if [[ -z "$original_timezone" && -z "$original_timezone_path" ]]; then
-        if [[ -n "$current_tz" ]]; then
+        if [[ -n "$current_tz" ]] && [[ -f "/usr/share/zoneinfo/$current_tz" ]]; then
             original_timezone="$current_tz"
         elif [[ -L /etc/localtime ]]; then
-            # Only accept a canonical system zoneinfo path; never a shim path
             candidate=$(readlink -f /etc/localtime)
             case "$candidate" in
                 /usr/share/zoneinfo/*) original_timezone_path="$candidate" ;;
+                *) info "No canonical original timezone detectable; not writing restoration metadata" ;;
             esac
         fi
     fi
+else
+    # User scope: pick the source zone the same way.
+    current_tz=$(detect_current_timezone || echo "")
+    while IFS=$'\t' read -r src id _a _b _c _d; do
+        if [[ "$current_tz" == "$src" ]]; then
+            selected_source_zone="$src"
+            selected_custom_zone="$id"
+            break
+        fi
+    done <<< "$ZONES_TSV"
 fi
 
-# Read configuration and process each zone
-patched_count=0
-skipped_count=0
-error_count=0
-declare -a successfully_patched_zones=()
+# ============================================================================
+# Dry-run reporting
+# ============================================================================
 
-while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
-    # Skip comments and empty lines
-    [[ "$iana_zone" =~ ^#.*$ ]] && continue
-    [[ -z "$iana_zone" ]] && continue
-
-    system_zone="/usr/share/zoneinfo/${iana_zone}"
-    target_zone="${ZONEINFO_DIR}/${iana_zone}"
-    target_dir="$(dirname "$target_zone")"
-
-    # Print initial status line
-    echo -en "${BLUE}Processing:${NC} $iana_zone ($official_name) ... "
-
-    # Check if system zoneinfo file exists
-    if [[ ! -f "$system_zone" ]]; then
-        echo -e "${YELLOW}SKIP${NC} (zone file not found)"
-        skipped_count=$((skipped_count + 1))
-        continue
-    fi
-
-    # Validate source timezone file structure
-    if ! zdump -v "$system_zone" &>/dev/null; then
-        echo -e "${RED}SKIP${NC} (invalid source timezone file)"
-        error_count=$((error_count + 1))
-        continue
-    fi
-
-    # Idempotency check: if already patched, skip
-    if [[ -f "$target_zone" ]]; then
-        # Check if the official abbreviation is already present in recent dates
-        verify_year="2026"
-        if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
-            verify_year="2020"
-        fi
-
-        # Capture zdump output to avoid pipe buffering issues
-        zdump_output=$(zdump -v "$target_zone" 2>/dev/null)
-        if echo "$zdump_output" | grep -q "$verify_year.*$official_abbrev"; then
-            echo -e "${YELLOW}SKIP${NC} (already patched)"
-            skipped_count=$((skipped_count + 1))
-            successfully_patched_zones+=("$iana_zone")
-            continue
-        fi
-
-        # Backup existing file before overwriting
-        cp "$target_zone" "${target_zone}.backup.$(date +%s)"
-    fi
-
-    # Create directory structure
-    mkdir -p "$target_dir"
-
-    # Copy system zoneinfo file
-    cp "$system_zone" "$target_zone"
-
-    # Patch the file using targeted binary patching
-    patch_count=$(patch_tzif_file "$target_zone" "$iana_abbrev" "$official_abbrev" 2>/dev/null) || patch_count=0
-
-    if [[ "$patch_count" -gt 0 ]]; then
-        # Verify structural integrity
-        if verify_tzif_integrity "$target_zone" "$system_zone"; then
-            # Verify the abbreviation appears in recent dates
-            verify_year="2026"
-            if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
-                verify_year="2020"
-            fi
-
-            zdump_output=$(zdump -v "$target_zone")
-            pattern="$verify_year.*$official_abbrev"
-
-            if echo "$zdump_output" | grep -q "$pattern"; then
-                # Verify UTC offset is correct
-                expected_offset=""
-                case "$official_abbrev" in
-                    PCT) expected_offset="-0700" ;;
-                    ABT) expected_offset="-0600" ;;
-                    YST) expected_offset="-0700" ;;
-                    MBT) expected_offset="-0500" ;;
-                    NWT) expected_offset="-0600" ;;
-                esac
-
-                if [[ -n "$expected_offset" ]]; then
-                    # Test a date after the transition
-                    test_date="2026-12-15"
-                    if [[ "$iana_zone" == *"Whitehorse"* || "$iana_zone" == *"Dawson"* ]]; then
-                        test_date="2021-06-15"
-                    fi
-
-                    actual_offset=$(TZ="$target_zone" date -d "$test_date 12:00:00" +"%z" 2>/dev/null || echo "")
-                    if [[ "$actual_offset" == "$expected_offset" ]]; then
-                        echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev ($patch_count locations)"
-                        patched_count=$((patched_count + 1))
-                        successfully_patched_zones+=("$iana_zone")
-                    else
-                        echo -e "${RED}✗${NC} UTC offset mismatch (expected $expected_offset, got $actual_offset)"
-                        rm -f "$target_zone"
-                        error_count=$((error_count + 1))
-                    fi
-                else
-                    echo -e "${GREEN}✓${NC} $iana_abbrev → $official_abbrev ($patch_count locations)"
-                    patched_count=$((patched_count + 1))
-                    successfully_patched_zones+=("$iana_zone")
-                fi
-            else
-                echo -e "${RED}✗${NC} verification failed"
-                rm -f "$target_zone"
-                error_count=$((error_count + 1))
-            fi
-        else
-            echo -e "${RED}✗${NC} integrity check failed"
-            rm -f "$target_zone"
-            error_count=$((error_count + 1))
-        fi
-    else
-        echo -e "${RED}✗${NC} no locations patched"
-        rm -f "$target_zone"
-        error_count=$((error_count + 1))
-    fi
-
-done < "$CONFIG_FILE"
-
-# Summary
-header "Installation Summary"
-echo ""
-echo "  Zones patched: $patched_count"
-echo "  Zones skipped: $skipped_count"
-echo "  Errors: $error_count"
-echo ""
-
-# Determine installation status
-if [[ $patched_count -eq 0 && $skipped_count -eq 0 ]]; then
-    # Total failure
-    error "No zones were patched. Installation failed."
-    error "Please check the errors above and ensure tzdata is properly installed."
-    exit 1
-elif [[ $error_count -gt 0 && $patched_count -eq 0 ]]; then
-    # All attempted patches failed
-    error "All patch attempts failed. Installation incomplete."
-    error "No timezone activation performed."
-    exit 1
-elif [[ $error_count -gt 0 ]]; then
-    # Partial success
-    warn "Partial installation: $patched_count succeeded, $error_count failed."
-    warn "Only successfully patched zones will be activated."
-fi
-
-if [[ $patched_count -gt 0 || ($skipped_count -gt 0 && $error_count -eq 0) ]]; then
-    if [[ $patched_count -gt 0 ]]; then
-        info "Installation complete!"
-    else
-        info "All zones are already patched. No changes needed."
+if [[ "$DRY_RUN" == "true" ]]; then
+    header "Dry run — planned changes (scope: $SCOPE)"
+    echo ""
+    echo "Base directory: ${ZONEINFO_DIR}"
+    echo "Manifest:       $(custom_zones_manifest_path "$SCOPE")"
+    echo "System state:   ${STATE_DIR}"
+    if [[ "$SCOPE" == "system" ]]; then
+        echo "Config:         ${CONFIG_PATH}"
+        echo "/etc/localtime: would symlink to ${ZONEINFO_DIR}/${selected_custom_zone}"
     fi
     echo ""
+    echo "Custom zones to install:"
+    while IFS=$'\t' read -r src id iab oab _n _u; do
+        echo "  ${src}  →  ${id}  (${iab} → ${oab})"
+    done <<< "$ZONES_TSV"
+    exit 0
+fi
 
-    if [[ "$SYSTEM_WIDE" == "true" ]]; then
-        # Store selected zone for systemd service
-        mkdir -p "$STATE_DIR"
-        echo "$selected_zone" > "${STATE_DIR}/selected-zone"
+# ============================================================================
+# Install custom zones
+# ============================================================================
 
-        # Save original timezone metadata (only if not already saved)
-        if [[ ! -f "$CONFIG_PATH" ]]; then
+header "Installing Canadian custom zones (scope: $SCOPE)"
+echo ""
+patched=0; skipped=0; failed=0
+declare -a installed_ids=()
+
+while IFS=$'\t' read -r src id iab oab name _u; do
+    echo -en "${BLUE}Processing:${NC} $src → $id (${name}) ... "
+    if custom_zones_install "$SCOPE" "$src" "$id" "$iab" "$oab" "$PATCHER"; then
+        echo -e "${GREEN}✓${NC}"
+        patched=$((patched + 1))
+        installed_ids+=("$id")
+    else
+        rc=$?
+        echo -e "${RED}✗ (rc=$rc)${NC}"
+        failed=$((failed + 1))
+    fi
+done <<< "$ZONES_TSV"
+
+echo ""
+header "Summary"
+echo "  Installed: $patched"
+echo "  Failed:    $failed"
+
+if [[ $patched -eq 0 ]]; then
+    error "No zones were installed. Nothing activated."
+    exit 1
+fi
+
+if [[ $failed -gt 0 ]]; then
+    warn "Partial installation: $patched succeeded, $failed failed."
+    warn "Only successfully installed zones will be activated."
+fi
+
+# ============================================================================
+# Persist state and activate /etc/localtime (system scope only)
+# ============================================================================
+
+mkdir -p "$STATE_DIR"
+write_state_file() {
+    local name="$1" value="$2"
+    local target="${STATE_DIR}/${name}"
+    local tmp="${target}.tmp.$$"
+    printf '%s\n' "$value" > "$tmp"
+    mv -T -- "$tmp" "$target"
+}
+
+# New state model: distinct source and custom, plus backward-compat file.
+write_state_file "selected-source-zone" "$selected_source_zone"
+write_state_file "selected-custom-zone" "$selected_custom_zone"
+write_state_file "installed-scope" "$SCOPE"
+write_state_file "installed-version" "$CURRENT_VERSION"
+
+if [[ "$SCOPE" == "system" ]]; then
+    # Save original-timezone metadata (preserved across reinstalls)
+    if [[ ! -f "$CONFIG_PATH" ]] || ! grep -q '^original_' "$CONFIG_PATH" 2>/dev/null; then
+        tmp="${CONFIG_PATH}.tmp.$$"
+        {
             if [[ -n "$original_timezone" ]]; then
-                {
-                    echo "original_timezone=$original_timezone"
-                    echo "installed_version=$CURRENT_VERSION"
-                    echo "schema_version=1"
-                } > "$CONFIG_PATH"
-                info "Saved original timezone to $CONFIG_PATH: $original_timezone"
-            elif [[ -n "$original_timezone_path" ]]; then
-                {
-                    echo "original_timezone_path=$original_timezone_path"
-                    echo "installed_version=$CURRENT_VERSION"
-                    echo "schema_version=1"
-                } > "$CONFIG_PATH"
-                info "Saved original /etc/localtime target to $CONFIG_PATH: $original_timezone_path"
+                echo "original_timezone=${original_timezone}"
             fi
-        else
-            # Update version in existing config
-            if ! grep -q "^installed_version=" "$CONFIG_PATH" 2>/dev/null; then
-                echo "installed_version=$CURRENT_VERSION" >> "$CONFIG_PATH"
+            if [[ -n "$original_timezone_path" ]]; then
+                echo "original_timezone_path=${original_timezone_path}"
             fi
-            if ! grep -q "^schema_version=" "$CONFIG_PATH" 2>/dev/null; then
-                echo "schema_version=1" >> "$CONFIG_PATH"
-            fi
-        fi
-
-        # Create symlink to /etc/localtime only if the selected zone was successfully patched
-        target_zone="${ZONEINFO_DIR}/${selected_zone}"
-        if [[ -f "$target_zone" ]]; then
-            ln -sf "$target_zone" /etc/localtime
-            info "Updated /etc/localtime → $selected_zone"
-        else
-            warn "Selected zone $selected_zone was not successfully patched"
-            warn "/etc/localtime not updated"
-        fi
-
-        # Install systemd service
-        if command -v systemctl &>/dev/null; then
-            mkdir -p /usr/local/libexec/canadian-tz-shim
-            cp "${SCRIPT_DIR}/lib/reapply.sh" /usr/local/libexec/canadian-tz-shim/
-            chmod +x /usr/local/libexec/canadian-tz-shim/reapply.sh
-
-            # Copy the patch helper if it exists as a standalone script
-            if [[ -f "${SCRIPT_DIR}/lib/patch_tzif.py" ]]; then
-                cp "${SCRIPT_DIR}/lib/patch_tzif.py" /usr/local/libexec/canadian-tz-shim/
-                chmod +x /usr/local/libexec/canadian-tz-shim/patch_tzif.py
-            fi
-
-            mkdir -p /usr/local/share/canadian-tz-shim
-            cp "${SCRIPT_DIR}/zones.conf" /usr/local/share/canadian-tz-shim/
-
-            cp "${SCRIPT_DIR}/lib/canadian-tz-shim.service" /etc/systemd/system/
-            cp "${SCRIPT_DIR}/lib/canadian-tz-shim.path" /etc/systemd/system/
-
-            systemctl daemon-reload
-            systemctl enable canadian-tz-shim.path
-            systemctl start canadian-tz-shim.path
-
-            info "Installed systemd service to watch for tzdata updates"
-        fi
-
-        echo ""
-        echo "The shim is now active system-wide. Changes take effect immediately."
-        echo ""
-        echo "To verify:"
-        echo "  date +'%Z %z'"
-
-        # Extract official abbreviation for selected zone
-        while IFS='|' read -r iana_zone iana_abbrev official_abbrev official_name reference_url; do
-            [[ "$iana_zone" =~ ^#.*$ ]] && continue
-            [[ -z "$iana_zone" ]] && continue
-            if [[ "$iana_zone" == "$selected_zone" ]]; then
-                echo "  # Should show: $official_abbrev"
-                break
-            fi
-        done < "$CONFIG_FILE"
+            echo "installed_version=${CURRENT_VERSION}"
+            echo "schema_version=${CONFIG_SCHEMA_VERSION}"
+        } > "$tmp"
+        mv -T -- "$tmp" "$CONFIG_PATH"
     else
-        # Save original timezone to ~/.config/tzshim.conf (only if not already saved)
-        if [[ ! -f "$CONFIG_PATH" ]]; then
-            current_tz=$(detect_current_timezone || echo "")
-            mkdir -p "${HOME}/.config"
-            if [[ -n "$current_tz" ]]; then
-                {
-                    echo "original_timezone=$current_tz"
-                    echo "installed_version=$CURRENT_VERSION"
-                    echo "schema_version=1"
-                } > "$CONFIG_PATH"
-                info "Saved original timezone to $CONFIG_PATH: $current_tz"
-            elif [[ -L /etc/localtime ]]; then
-                current_link=$(readlink -f /etc/localtime)
-                # Only accept a canonical system zoneinfo path; never a shim path
-                case "$current_link" in
-                    /usr/share/zoneinfo/*)
-                        {
-                            echo "original_timezone_path=$current_link"
-                            echo "installed_version=$CURRENT_VERSION"
-                            echo "schema_version=1"
-                        } > "$CONFIG_PATH"
-                        info "Saved original /etc/localtime target to $CONFIG_PATH: $current_link"
-                        ;;
-                    *)
-                        info "No canonical original timezone detectable; not writing restoration metadata"
-                        {
-                            echo "installed_version=$CURRENT_VERSION"
-                            echo "schema_version=1"
-                        } > "$CONFIG_PATH"
-                        ;;
-                esac
-            fi
-        else
-            # Update version in existing config
-            if ! grep -q "^installed_version=" "$CONFIG_PATH" 2>/dev/null; then
-                echo "installed_version=$CURRENT_VERSION" >> "$CONFIG_PATH"
-            fi
-            if ! grep -q "^schema_version=" "$CONFIG_PATH" 2>/dev/null; then
-                echo "schema_version=1" >> "$CONFIG_PATH"
-            fi
+        # Just bump version fields in the existing file
+        if ! grep -q '^installed_version=' "$CONFIG_PATH"; then
+            echo "installed_version=${CURRENT_VERSION}" >> "$CONFIG_PATH"
         fi
-
-        echo "To use the patched timezones, set TZ to the patched zone path:"
-        echo ""
-        echo "  # For Vancouver (Pacific Time):"
-        echo "  export TZ=${ZONEINFO_DIR}/America/Vancouver"
-        echo ""
-        echo "  # For Edmonton (Alberta Time):"
-        echo "  export TZ=${ZONEINFO_DIR}/America/Edmonton"
-        echo ""
-        echo "  # For Whitehorse (Yukon Standard Time):"
-        echo "  export TZ=${ZONEINFO_DIR}/America/Whitehorse"
-        echo ""
-        echo "  # For Winnipeg (Manitoba Standard Time):"
-        echo "  export TZ=${ZONEINFO_DIR}/America/Winnipeg"
-        echo ""
-        echo "  # For Yellowknife (Northwest Territories Time):"
-        echo "  export TZ=${ZONEINFO_DIR}/America/Yellowknife"
-        echo ""
-        echo "Add the export to your shell profile (~/.bashrc, ~/.zshrc, etc.) for persistence."
-        echo ""
-        echo "For system-wide installation with automatic updates, run this script as root:"
-        echo "  sudo $0"
     fi
 
+    # Symlink /etc/localtime to the custom zone we just installed.
+    target="${ZONEINFO_DIR}/${selected_custom_zone}"
+    if [[ -f "$target" ]]; then
+        ln -sfn "$target" /etc/localtime
+        info "/etc/localtime → ${selected_custom_zone}"
+    else
+        warn "Selected custom zone $selected_custom_zone not installed; /etc/localtime unchanged."
+    fi
+
+    # Install + enable systemd path/service so tzdata updates rebuild custom zones
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl daemon-reload 2>/dev/null; then
+            systemd_ok=true
+        else
+            warn "systemd is not reachable (container? --user session?); skipping service install"
+            systemd_ok=false
+        fi
+        if [[ "$systemd_ok" == "true" ]]; then
+            if mkdir -p /usr/local/libexec/canadian-tz-shim 2>/dev/null; then
+                install -m 0755 "${SCRIPT_DIR}/lib/reapply.sh" \
+                    /usr/local/libexec/canadian-tz-shim/reapply.sh
+                install -m 0755 "${SCRIPT_DIR}/lib/patch_tzif.py" \
+                    /usr/local/libexec/canadian-tz-shim/patch_tzif.py
+                install -m 0755 "${SCRIPT_DIR}/lib/custom_zones.sh" \
+                    /usr/local/libexec/canadian-tz-shim/custom_zones.sh
+                mkdir -p /usr/local/share/canadian-tz-shim
+                install -m 0644 "${SCRIPT_DIR}/zones.conf" \
+                    /usr/local/share/canadian-tz-shim/zones.conf
+                install -m 0644 "${SCRIPT_DIR}/lib/canadian-tz-shim.service" \
+                    /etc/systemd/system/canadian-tz-shim.service
+                install -m 0644 "${SCRIPT_DIR}/lib/canadian-tz-shim.path" \
+                    /etc/systemd/system/canadian-tz-shim.path
+                systemctl enable canadian-tz-shim.path 2>/dev/null || true
+                systemctl start  canadian-tz-shim.path 2>/dev/null || true
+                info "Installed systemd path unit to rebuild custom zones on tzdata updates"
+            else
+                warn "Cannot write /usr/local/libexec/canadian-tz-shim — systemd watcher NOT installed."
+                warn "Reapply after tzdata updates will need to be triggered manually."
+            fi
+        fi
+    fi
+else
+    # User-scope config metadata only
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        mkdir -p "$(dirname "$CONFIG_PATH")"
+        {
+            echo "installed_version=${CURRENT_VERSION}"
+            echo "schema_version=${CONFIG_SCHEMA_VERSION}"
+            echo "scope=user"
+        } > "$CONFIG_PATH"
+    fi
+fi
+
+echo ""
+header "Done."
+echo ""
+if [[ "$SCOPE" == "system" ]]; then
+    echo "The shim is now active system-wide via a custom identifier."
+    echo "Official /usr/share/zoneinfo/America/* files are untouched; the installer"
+    echo "added narrow, reversible registration lines to zone.tab / zone1970.tab"
+    echo "so Qt's country() and comment() resolve for the custom identifier."
     echo ""
-    echo "To uninstall, run: ./uninstall.sh"
+    echo "Verification:"
+    echo "  date +'%Z %z'    # should show $(echo "$ZONES_TSV" | awk -F'\t' -v s="$selected_source_zone" '$1==s{print $4}')"
+    echo ""
+    echo "KDE Plasma users: Qt parses zone.tab once at process start. Restart"
+    echo "plasmashell once so the digital clock picks up the new tab entry:"
+    echo "  systemctl --user restart plasma-plasmashell.service"
+    echo "After that the clock follows /etc/localtime automatically and shows the"
+    echo "Canadian abbreviation. If an individual clock applet stores an explicit"
+    echo "IANA id (rather than 'Local'), the desktop-patch companion utility can"
+    echo "migrate just that one stored value to the custom identifier."
+    echo ""
+    echo "To uninstall: sudo ${SCRIPT_DIR}/uninstall.sh"
+else
+    echo "Installed to: ${ZONEINFO_DIR}/"
+    echo ""
+    echo "To use the custom zones, set TZ to the full path:"
+    echo ""
+    while IFS=$'\t' read -r src id _a _b _c _d; do
+        echo "  export TZ=${ZONEINFO_DIR}/${id}"
+    done <<< "$ZONES_TSV"
+    echo ""
+    echo "Note: Qt (and therefore KDE, GNOME, and most other desktop clocks)"
+    echo "searches /usr/share/zoneinfo/ only. It does not discover custom zones"
+    echo "under \$HOME/.tzinfo/, and it does not honour \$TZDIR in current"
+    echo "Qt 5 / Qt 6 builds. This user-scope install benefits the command line"
+    echo "(\`date\`, \`TZ=.../Canadian/PCT\`) and Python's zoneinfo. For a desktop"
+    echo "clock to show the Canadian abbreviation, install system-wide instead:"
+    echo "  sudo ${SCRIPT_DIR}/install.sh"
 fi

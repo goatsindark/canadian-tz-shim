@@ -152,7 +152,7 @@ fi
 # ---------------------------------------------------------------------------
 info "R7: install.sh rejects shim-local paths as original timezone metadata"
 count
-if grep -q '/usr/local/share/zoneinfo/\*)' "$SCRIPT_DIR/install.sh"; then
+if grep -Eq '/usr/local/share/zoneinfo/\*|\.tzinfo' "$SCRIPT_DIR/install.sh"; then
     pass "install.sh filters shim install dir from detected timezone"
 else
     fail "install.sh lacks self-reference guard"
@@ -391,6 +391,69 @@ fi
 rm -rf "$T"
 
 echo
+# ---------------------------------------------------------------------------
+# R13: patcher audit — no historical abbreviation drift on any Canadian zone
+# ---------------------------------------------------------------------------
+info "R13: patch_tzif.py preserves every pre-switchover abbreviation"
+count
+audit_out=$(python3 "$SCRIPT_DIR/tools/patcher_audit.py" 2>&1) || true
+if echo "$audit_out" | grep -q "OVERALL: PASS" \
+   && ! echo "$audit_out" | grep -q "HISTORICAL ALTERED"; then
+    pass "patcher preserves all historical abbreviations (6/6 zones)"
+else
+    fail "patcher audit detected historical drift or refused to run"
+fi
+
+# ---------------------------------------------------------------------------
+# R14: patcher refuses multi-match pool entries (defense-in-depth)
+# ---------------------------------------------------------------------------
+info "R14: patcher refuses pools that contain multiple standalone matches"
+count
+tmp=$(mktemp)
+python3 - "$tmp" <<'PY'
+import struct, sys
+# Pool with two independent "MST" entries — must be refused by the patcher.
+header = b"TZif" + b"\0"*16 + struct.pack(">6I", 0,0,0, 0, 2, 8)
+ttinfos = struct.pack(">iBB", 0, 0, 0) + struct.pack(">iBB", 0, 0, 4)
+pool = b"MST\x00MST\x00"
+open(sys.argv[1], "wb").write(header + ttinfos + pool)
+PY
+if python3 "$SCRIPT_DIR/lib/patch_tzif.py" "$tmp" MST PCT 2>/dev/null; then
+    rm -f "$tmp"
+    fail "patcher accepted a multi-match pool (should have refused)"
+else
+    rm -f "$tmp"
+    pass "patcher refused a multi-match pool"
+fi
+
+# ---------------------------------------------------------------------------
+# R15: patcher preserves substring-contains-target pool entries
+# ---------------------------------------------------------------------------
+info "R15: patcher preserves an entry that merely contains the target as substring"
+count
+tmp=$(mktemp)
+python3 - "$tmp" <<'PY'
+import struct, sys
+header = b"TZif" + b"\0"*16 + struct.pack(">6I", 0,0,0, 0, 2, 9)
+ttinfos = struct.pack(">iBB", 0, 0, 0) + struct.pack(">iBB", 0, 0, 5)
+pool = b"AMST\x00MST\x00"
+open(sys.argv[1], "wb").write(header + ttinfos + pool)
+PY
+if python3 "$SCRIPT_DIR/lib/patch_tzif.py" "$tmp" MST PCT >/dev/null; then
+    after=$(python3 -c "import sys; d=open('$tmp','rb').read(); print(d[-9:])")
+    rm -f "$tmp"
+    if [[ "$after" == *"AMST"* ]]; then
+        pass "AMST preserved; standalone MST replaced"
+    else
+        fail "AMST was clobbered by the substring patch: $after"
+    fi
+else
+    rm -f "$tmp"
+    fail "patcher refused a legitimate single-match pool"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================"
 echo "Regression Summary"
 echo "========================================"

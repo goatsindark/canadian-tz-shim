@@ -1,456 +1,363 @@
 #!/usr/bin/env bash
-# Canadian Timezone Shim - Uninstall script
-# Safely removes only files created by the shim
-# Handles legacy installations and edge cases
+# Canadian Timezone Shim - Uninstall script (v2)
+#
+# Removes only files the shim recorded in its manifest as owned, restores
+# /etc/localtime to the original recorded target, and cleans state.
+# Never deletes an unowned file.
 
 set -euo pipefail
 
-# Determine installation scope
 if [[ $EUID -eq 0 ]]; then
-    ZONEINFO_DIR="/usr/local/share/zoneinfo"
+    SCOPE="system"
+    ZONEINFO_DIR="/usr/share/zoneinfo"
     STATE_DIR="/var/lib/canadian-tz-shim"
-    SYSTEM_WIDE=true
 else
+    SCOPE="user"
     ZONEINFO_DIR="${HOME}/.tzinfo"
     STATE_DIR="${HOME}/.local/state/canadian-tz-shim"
-    SYSTEM_WIDE=false
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/zones.conf"
+CUSTOM_ZONES_LIB="${SCRIPT_DIR}/lib/custom_zones.sh"
+# The installer may have copied the library to the exec dir; if we run from a
+# checkout, use the checkout.
+if [[ ! -f "$CUSTOM_ZONES_LIB" ]]; then
+    CUSTOM_ZONES_LIB="/usr/local/libexec/canadian-tz-shim/custom_zones.sh"
+fi
+if [[ -f "$CUSTOM_ZONES_LIB" ]]; then
+    # shellcheck source=lib/custom_zones.sh
+    source "$CUSTOM_ZONES_LIB"
+fi
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+header(){ echo -e "${BLUE}$*${NC}"; }
 
-info() {
-    echo -e "${GREEN}[INFO]${NC} $*"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
-}
-
-header() {
-    echo -e "${BLUE}$*${NC}"
-}
-
-# Parse command line arguments
 FORCE=false
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --force|-f)
-            FORCE=true
-            shift
-            ;;
+        --force|-f) FORCE=true; shift ;;
         --help|-h)
-            echo "Usage: $0 [OPTIONS]"
-            echo ""
-            echo "Options:"
-            echo "  --force, -f    Force uninstallation even if restoration fails"
-            echo "  --help, -h     Show this help message"
-            echo ""
-            echo "The uninstaller will:"
-            echo "  1. Stop and remove systemd services (system-wide only)"
-            echo "  2. Restore /etc/localtime to the original timezone"
-            echo "  3. Remove patched timezone files"
-            echo "  4. Remove state and configuration files"
-            echo ""
-            echo "If restoration fails, the uninstaller will exit without removing"
-            echo "files to avoid breaking the system. Use --force to override."
-            exit 0
-            ;;
-        *)
-            error "Unknown option: $1"
-            exit 1
-            ;;
+            cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --force, -f  Force uninstallation even if restoration fails
+  --help, -h   Show this help message
+
+The uninstaller will:
+  1. Stop and remove systemd services (system-wide)
+  2. Restore /etc/localtime to the original timezone
+  3. Remove ONLY the custom zones recorded in the shim manifest as owned
+  4. Remove state and configuration files
+EOF
+            exit 0 ;;
+        *) error "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 header "Canadian Timezone Shim Uninstaller"
 echo ""
-
-if [[ "$SYSTEM_WIDE" == "true" ]]; then
-    echo "This will remove system-wide patched timezones from: $ZONEINFO_DIR"
-    echo ""
-    echo "WARNING: /etc/localtime will be restored to the original system timezone."
-    echo ""
+if [[ "$SCOPE" == "system" ]]; then
+    echo "This will remove custom Canadian zones from: ${ZONEINFO_DIR}/Canadian/"
+    echo "/etc/localtime will be restored to the original system timezone."
 else
-    echo "This will remove user patched timezones from: $ZONEINFO_DIR"
+    echo "This will remove custom Canadian zones from: ${ZONEINFO_DIR}/Canadian/"
 fi
 echo ""
 read -p "Are you sure you want to continue? [y/N] " -r
 echo ""
-
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     info "Uninstallation cancelled."
     exit 0
 fi
 
-# Remove systemd service if it exists
-if [[ "$SYSTEM_WIDE" == "true" ]] && command -v systemctl &>/dev/null; then
-    # Check for current service name
+# ============================================================================
+# Stop systemd services (system scope)
+# ============================================================================
+
+if [[ "$SCOPE" == "system" ]] && command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet canadian-tz-shim.path 2>/dev/null; then
-        info "Stopping systemd service..."
-        systemctl stop canadian-tz-shim.path
-        systemctl disable canadian-tz-shim.path
+        info "Stopping systemd path unit..."
+        systemctl stop canadian-tz-shim.path 2>/dev/null || true
+        systemctl disable canadian-tz-shim.path 2>/dev/null || true
     fi
-
-    # Remove current service files
-    if [[ -f /etc/systemd/system/canadian-tz-shim.service ]]; then
-        info "Removing systemd service files..."
-        rm -f /etc/systemd/system/canadian-tz-shim.service
-        rm -f /etc/systemd/system/canadian-tz-shim.path
-        systemctl daemon-reload
-    fi
-
-    # Check for legacy service names (older versions)
-    for legacy_service in canadian-tz-shim.service canadian-tz-shim.path; do
-        if systemctl is-active --quiet "$legacy_service" 2>/dev/null; then
-            info "Stopping legacy systemd service: $legacy_service"
-            systemctl stop "$legacy_service" 2>/dev/null || true
-            systemctl disable "$legacy_service" 2>/dev/null || true
-        fi
-        if [[ -f "/etc/systemd/system/$legacy_service" ]]; then
-            info "Removing legacy systemd service file: $legacy_service"
-            rm -f "/etc/systemd/system/$legacy_service"
-            systemctl daemon-reload 2>/dev/null || true
+    for unit in canadian-tz-shim.service canadian-tz-shim.path; do
+        if [[ -f "/etc/systemd/system/$unit" ]]; then
+            rm -f "/etc/systemd/system/$unit"
+            info "Removed /etc/systemd/system/$unit"
         fi
     done
+    systemctl daemon-reload 2>/dev/null || true
 
-    # Remove legacy installation directories
-    for legacy_dir in /usr/local/libexec/canadian-tz-shim /usr/local/share/canadian-tz-shim; do
-        if [[ -d "$legacy_dir" ]]; then
-            info "Removing legacy directory: $legacy_dir"
-            rm -rf "$legacy_dir"
+    # Remove runtime install artifacts
+    for d in /usr/local/libexec/canadian-tz-shim /usr/local/share/canadian-tz-shim; do
+        if [[ -d "$d" ]]; then
+            rm -rf -- "$d"
+            info "Removed $d"
         fi
     done
 fi
 
-# Restore /etc/localtime if system-wide (BEFORE removing files)
-restoration_failed=false
-if [[ "$SYSTEM_WIDE" == "true" ]]; then
-    # Try to read original timezone from config file
-    original_timezone=""
-    original_timezone_path=""
-    
-    if [[ -f /etc/tzshim.conf ]]; then
-        # Source the config file to get variables
-        source /etc/tzshim.conf
-        original_timezone="${original_timezone:-}"
-        original_timezone_path="${original_timezone_path:-}"
-    fi
+# ============================================================================
+# Read state (must be BEFORE we delete the state dir)
+# ============================================================================
 
-    # If we have original timezone info, try to restore
-    if [[ -n "$original_timezone" ]]; then
-        # Restore to the original timezone name
-        if [[ -f "/usr/share/zoneinfo/$original_timezone" ]]; then
-            info "Restoring /etc/localtime to original timezone: $original_timezone"
-            if ln -sf "/usr/share/zoneinfo/$original_timezone" /etc/localtime; then
-                info "✓ /etc/localtime restored successfully"
+CONFIG_PATH=""
+if [[ "$SCOPE" == "system" ]]; then
+    CONFIG_PATH="/etc/tzshim.conf"
+else
+    CONFIG_PATH="${HOME}/.config/tzshim.conf"
+fi
+
+original_timezone=""
+original_timezone_path=""
+selected_custom_zone=""
+selected_source_zone=""
+
+if [[ -f "$CONFIG_PATH" ]]; then
+    # Read fields without executing arbitrary code
+    while IFS='=' read -r k v; do
+        case "$k" in
+            original_timezone)       original_timezone="$v" ;;
+            original_timezone_path)  original_timezone_path="$v" ;;
+        esac
+    done < "$CONFIG_PATH"
+fi
+
+if [[ -f "${STATE_DIR}/selected-source-zone" ]]; then
+    selected_source_zone=$(<"${STATE_DIR}/selected-source-zone")
+fi
+if [[ -f "${STATE_DIR}/selected-custom-zone" ]]; then
+    selected_custom_zone=$(<"${STATE_DIR}/selected-custom-zone")
+fi
+# Legacy field name from 1.x
+if [[ -f "${STATE_DIR}/selected-zone" ]] && [[ -z "$selected_source_zone" ]]; then
+    legacy=$(<"${STATE_DIR}/selected-zone")
+    # In 1.x, selected-zone held the IANA id (e.g. America/Vancouver)
+    selected_source_zone="$legacy"
+fi
+
+# ============================================================================
+# Restore /etc/localtime BEFORE removing files
+# ============================================================================
+
+restoration_failed=false
+if [[ "$SCOPE" == "system" ]]; then
+    current_localtime=$(readlink /etc/localtime 2>/dev/null || echo "")
+
+    # Is /etc/localtime currently pointing inside our Canadian/ install?
+    is_shim_owned=false
+    case "$current_localtime" in
+        "${ZONEINFO_DIR}"/Canadian/*) is_shim_owned=true ;;
+        "/usr/local/share/zoneinfo"/*) is_shim_owned=true ;;   # 1.x layout
+        "${HOME}/.tzinfo"/*) is_shim_owned=true ;;
+    esac
+
+    if [[ "$is_shim_owned" == "true" ]]; then
+        if [[ -n "$original_timezone" && -f "/usr/share/zoneinfo/$original_timezone" ]]; then
+            if ln -sfn "/usr/share/zoneinfo/$original_timezone" /etc/localtime; then
+                info "Restored /etc/localtime → ${original_timezone}"
             else
                 error "Failed to restore /etc/localtime"
                 restoration_failed=true
             fi
+        elif [[ -n "$original_timezone_path" && -f "$original_timezone_path" ]]; then
+            # Reject self-referential paths (from older buggy releases)
+            case "$original_timezone_path" in
+                "${ZONEINFO_DIR}"/Canadian/*|/usr/local/share/zoneinfo/*|*/.tzinfo/*)
+                    warn "original_timezone_path resolves inside shim territory: $original_timezone_path"
+                    rel="${original_timezone_path#/usr/local/share/zoneinfo/}"
+                    rel="${rel#$ZONEINFO_DIR/}"
+                    rel="${rel##*/.tzinfo/}"
+                    if [[ -f "/usr/share/zoneinfo/${rel}" ]]; then
+                        info "Recovering to equivalent system zone: $rel"
+                        ln -sfn "/usr/share/zoneinfo/${rel}" /etc/localtime || restoration_failed=true
+                    else
+                        warn "No equivalent system timezone found"
+                        restoration_failed=true
+                    fi
+                    ;;
+                *)
+                    if ln -sfn "$original_timezone_path" /etc/localtime; then
+                        info "Restored /etc/localtime → ${original_timezone_path}"
+                    else
+                        restoration_failed=true
+                    fi
+                    ;;
+            esac
         else
-            warn "Original timezone file not found: /usr/share/zoneinfo/$original_timezone"
-            warn "/etc/localtime not restored"
-            restoration_failed=true
-        fi
-    elif [[ -n "$original_timezone_path" ]]; then
-        # Restore to the original path
-        # SAFETY: metadata recorded by an older release could point back into the
-        # shim's own install directory. Restoring to such a path and then deleting
-        # it would leave /etc/localtime dangling and break the system timezone.
-        case "$original_timezone_path" in
-            "$ZONEINFO_DIR"/*)
-                rel_path="${original_timezone_path#$ZONEINFO_DIR/}"
-                mapped_path="/usr/share/zoneinfo/${rel_path}"
-                warn "Saved original path points inside the shim install directory (self-referential metadata)."
-                if [[ -f "$mapped_path" ]]; then
-                    info "Recovering to equivalent system timezone: $mapped_path"
-                    original_timezone_path="$mapped_path"
+            warn "No original-timezone metadata available"
+            if [[ "$FORCE" == "true" ]] && [[ -n "$selected_source_zone" ]]; then
+                # Best-effort: fall back to a plausible sibling IANA zone.
+                suggested=""
+                case "$selected_source_zone" in
+                    *Vancouver*)   suggested="America/Los_Angeles" ;;
+                    *Edmonton*)    suggested="America/Denver" ;;
+                    *Whitehorse*|*Dawson*) suggested="America/Vancouver" ;;
+                    *Winnipeg*)    suggested="America/Chicago" ;;
+                    *Yellowknife*) suggested="America/Edmonton" ;;
+                esac
+                if [[ -n "$suggested" && -f "/usr/share/zoneinfo/$suggested" ]]; then
+                    info "Force mode: restoring to fallback $suggested"
+                    ln -sfn "/usr/share/zoneinfo/$suggested" /etc/localtime || restoration_failed=true
                 else
-                    warn "No equivalent system timezone found for: $rel_path"
-                    warn "/etc/localtime not restored"
-                    restoration_failed=true
-                    original_timezone_path=""
-                fi
-                ;;
-        esac
-
-        if [[ -n "$original_timezone_path" ]]; then
-            if [[ -f "$original_timezone_path" ]]; then
-                info "Restoring /etc/localtime to original path: $original_timezone_path"
-                if ln -sf "$original_timezone_path" /etc/localtime; then
-                    info "✓ /etc/localtime restored successfully"
-                else
-                    error "Failed to restore /etc/localtime"
                     restoration_failed=true
                 fi
             else
-                warn "Original timezone file not found: $original_timezone_path"
-                warn "/etc/localtime not restored"
                 restoration_failed=true
             fi
         fi
     else
-        # No config file or no original timezone info
-        # This can happen with older versions or corrupted installations
-        warn "No original timezone information found"
-        
-        # Try to detect what timezone was originally set
-        # Check if /etc/localtime currently points to one of our patched zones
-        current_target=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-        
-        if [[ -n "$current_target" ]]; then
-            # Check if it's pointing to one of our patched zones
-            is_patched=false
-            if [[ -f "$CONFIG_FILE" ]]; then
-                while IFS='|' read -r iana_zone _rest; do
-                    [[ "$iana_zone" =~ ^#.*$ ]] && continue
-                    [[ -z "$iana_zone" ]] && continue
-                    
-                    patched_path="${ZONEINFO_DIR}/${iana_zone}"
-                    if [[ "$current_target" == "$patched_path" ]]; then
-                        is_patched=true
-                        break
-                    fi
-                done < "$CONFIG_FILE"
-            fi
-            
-            if [[ "$is_patched" == "true" ]]; then
-                warn "/etc/localtime currently points to a patched zone"
-                warn "Cannot determine original timezone automatically"
-                
-                # Try to suggest a reasonable default based on the patched zone
-                suggested_zone=""
-                case "$current_target" in
-                    *Vancouver*) suggested_zone="America/Los_Angeles" ;;
-                    *Edmonton*) suggested_zone="America/Denver" ;;
-                    *Whitehorse*|*Dawson*) suggested_zone="America/Vancouver" ;;
-                    *Winnipeg*) suggested_zone="America/Chicago" ;;
-                    *Yellowknife*) suggested_zone="America/Edmonton" ;;
-                esac
-                
-                if [[ -n "$suggested_zone" && -f "/usr/share/zoneinfo/$suggested_zone" ]]; then
-                    warn "Suggested restoration target: $suggested_zone"
-                    warn "This is a reasonable default but may not match your original timezone"
-                    
-                    if [[ "$FORCE" == "true" ]]; then
-                        info "Force mode: restoring to $suggested_zone"
-                        if ln -sf "/usr/share/zoneinfo/$suggested_zone" /etc/localtime; then
-                            info "✓ /etc/localtime restored to $suggested_zone"
-                            restoration_failed=false
-                        else
-                            error "Failed to restore /etc/localtime"
-                            restoration_failed=true
-                        fi
-                    else
-                        warn "Run with --force to use suggested restoration, or restore manually"
-                        restoration_failed=true
-                    fi
-                else
-                    restoration_failed=true
-                fi
-            else
-                # /etc/localtime doesn't point to a patched zone
-                # Maybe it was already restored or never changed
-                info "/etc/localtime does not point to a patched zone"
-                info "No restoration needed"
-                restoration_failed=false
-            fi
-        else
-            warn "Cannot read /etc/localtime"
-            restoration_failed=true
-        fi
+        info "/etc/localtime does not point into shim territory; nothing to restore"
     fi
-
-    # Remove the config file if it exists
-    if [[ -f /etc/tzshim.conf ]]; then
-        rm -f /etc/tzshim.conf
-        info "Removed /etc/tzshim.conf"
-    fi
-else
-    # User mode: clean up config file if it exists
-    if [[ -f "${HOME}/.config/tzshim.conf" ]]; then
-        rm -f "${HOME}/.config/tzshim.conf"
-        info "Removed ~/.config/tzshim.conf"
-    fi
-    
-    # Check for legacy config locations
-    for legacy_config in "${HOME}/.tzshim.conf" "${HOME}/.config/canadian-tz-shim.conf"; do
-        if [[ -f "$legacy_config" ]]; then
-            info "Removing legacy config file: $legacy_config"
-            rm -f "$legacy_config"
-        fi
-    done
 fi
 
-# If restoration failed and not in force mode, don't remove the timezone files
-if [[ "$restoration_failed" == "true" && "$SYSTEM_WIDE" == "true" && "$FORCE" != "true" ]]; then
-    error "Restoration of /etc/localtime failed."
-    error "Keeping timezone files in $ZONEINFO_DIR to avoid breaking the system."
-    error ""
-    error "Options:"
-    error "  1. Manually restore /etc/localtime to the correct timezone"
-    error "  2. Re-run uninstall with --force to proceed anyway"
-    error ""
-    error "To manually restore, run:"
-    error "  sudo ln -sf /usr/share/zoneinfo/YOUR_TIMEZONE /etc/localtime"
-    exit 1
-fi
+# ============================================================================
+# Refuse to delete anything while /etc/localtime still resolves into our paths
+# ============================================================================
 
-if [[ "$restoration_failed" == "true" && "$FORCE" == "true" ]]; then
-    warn "Force mode: proceeding despite restoration failure"
-fi
-
-# Remove state directory
-if [[ -d "$STATE_DIR" ]]; then
-    info "Removing state directory..."
-    rm -rf "$STATE_DIR"
-fi
-
-# Check for legacy state directories
-for legacy_state in "${HOME}/.local/state/canadian-tz-shim" "/var/lib/canadian-tz-shim"; do
-    if [[ -d "$legacy_state" && "$legacy_state" != "$STATE_DIR" ]]; then
-        info "Removing legacy state directory: $legacy_state"
-        rm -rf "$legacy_state"
-    fi
-done
-
-# SAFETY: never delete timezone files that /etc/localtime still resolves to.
-# This catches self-referential metadata and any silent restoration failure.
-if [[ "$SYSTEM_WIDE" == "true" ]]; then
-    localtime_target=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-    case "$localtime_target" in
-        "$ZONEINFO_DIR"/*)
-            error "/etc/localtime still resolves inside $ZONEINFO_DIR ($localtime_target)."
+if [[ "$SCOPE" == "system" ]]; then
+    after_restore=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    case "$after_restore" in
+        "${ZONEINFO_DIR}"/Canadian/*|/usr/local/share/zoneinfo/*)
+            error "/etc/localtime still resolves into shim territory: $after_restore"
             error "Refusing to delete timezone files the system still depends on."
-            error "Restore /etc/localtime manually, then re-run uninstall:"
-            error "  sudo ln -sf /usr/share/zoneinfo/<Region/City> /etc/localtime"
-            exit 1
+            if [[ "$FORCE" != "true" ]]; then
+                error "Restore /etc/localtime manually and re-run, or use --force."
+                exit 1
+            else
+                warn "Force mode: continuing despite dangling /etc/localtime"
+            fi
             ;;
     esac
 fi
 
-# Safely remove only the timezone files we created
-if [[ -d "$ZONEINFO_DIR" ]]; then
-    info "Removing patched timezone files..."
+if [[ "$restoration_failed" == "true" && "$SCOPE" == "system" && "$FORCE" != "true" ]]; then
+    error "Restoration of /etc/localtime failed."
+    error "Keeping timezone files to avoid breaking the system."
+    error ""
+    error "Options:"
+    error "  1. Manually restore /etc/localtime to the correct timezone"
+    error "  2. Re-run with --force to proceed anyway"
+    exit 1
+fi
 
-    # Read zones.conf to know which files we created
-    if [[ -f "$CONFIG_FILE" ]]; then
-        while IFS='|' read -r iana_zone _rest; do
-            [[ "$iana_zone" =~ ^#.*$ ]] && continue
-            [[ -z "$iana_zone" ]] && continue
+# ============================================================================
+# Remove custom zones (only files recorded as owned by us)
+# ============================================================================
 
-            target_file="${ZONEINFO_DIR}/${iana_zone}"
-            if [[ -f "$target_file" ]]; then
-                rm -f "$target_file"
-                info "  Removed: $iana_zone"
-            fi
+manifest="$(custom_zones_manifest_path "$SCOPE")"
 
-            # Remove backup files too (current pattern)
-            for backup in "${target_file}.backup."*; do
-                if [[ -f "$backup" ]]; then
-                    rm -f "$backup"
-                fi
-            done
-            
-            # Check for legacy backup patterns
-            for legacy_backup in "${target_file}.bak" "${target_file}.old" "${target_file}~"; do
-                if [[ -f "$legacy_backup" ]]; then
-                    info "  Removed legacy backup: $(basename "$legacy_backup")"
-                    rm -f "$legacy_backup"
-                fi
-            done
-        done < "$CONFIG_FILE"
-    fi
-
-    # Check for orphaned files (files in ZONEINFO_DIR not in zones.conf)
-    if [[ -f "$CONFIG_FILE" ]]; then
-        orphaned_files=()
-        while IFS= read -r -d '' file; do
-            filename=$(basename "$file")
-            # Check if this file is in our zones.conf
-            is_known=false
-            while IFS='|' read -r iana_zone _rest; do
-                [[ "$iana_zone" =~ ^#.*$ ]] && continue
-                [[ -z "$iana_zone" ]] && continue
-                if [[ "$filename" == "$iana_zone" ]]; then
-                    is_known=true
-                    break
-                fi
-            done < "$CONFIG_FILE"
-            
-            # Check if it's a backup file
-            if [[ "$filename" == *.backup.* ]] || [[ "$filename" == *.bak ]] || [[ "$filename" == *.old ]]; then
-                is_known=true
-            fi
-            
-            if [[ "$is_known" == "false" ]]; then
-                orphaned_files+=("$file")
-            fi
-        done < <(find "$ZONEINFO_DIR" -type f -print0 2>/dev/null)
-        
-        if [[ ${#orphaned_files[@]} -gt 0 ]]; then
-            warn "Found ${#orphaned_files[@]} orphaned file(s) from previous installation:"
-            for orphaned in "${orphaned_files[@]}"; do
-                warn "  $(basename "$orphaned")"
-            done
-            warn "These files will not be removed automatically"
-            warn "Remove them manually if they are from an older version"
-        fi
-    fi
-
-    # Try to remove empty directories
-    if [[ -d "$ZONEINFO_DIR" ]]; then
-        # Only remove if directory is empty or contains only our files
-        if [[ -z "$(ls -A "$ZONEINFO_DIR" 2>/dev/null)" ]]; then
-            rmdir "$ZONEINFO_DIR" 2>/dev/null || true
-            info "Removed empty directory: $ZONEINFO_DIR"
+if [[ -f "$manifest" ]] && command -v custom_zones_list_owned >/dev/null 2>&1; then
+    info "Removing custom zones recorded as owned:"
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        if custom_zones_remove_owned "$SCOPE" "$id"; then
+            info "  removed $id"
         else
-            # Check if remaining files are not ours
-            remaining=$(find "$ZONEINFO_DIR" -type f 2>/dev/null | wc -l)
-            if [[ $remaining -gt 0 ]]; then
-                warn "Directory $ZONEINFO_DIR contains other files, not removing"
-                warn "Remaining files: $remaining"
-            else
-                rmdir "$ZONEINFO_DIR" 2>/dev/null || true
+            rc=$?
+            warn "  refused to remove $id (not owned by us, or hash changed)"
+            if [[ "$FORCE" != "true" ]]; then
+                error "Uninstall aborted. Investigate the file above or use --force."
+                exit 1
             fi
         fi
+    done < <(custom_zones_list_owned "$SCOPE")
+else
+    info "No custom-zone manifest found in $SCOPE scope; nothing generated by the shim to remove."
+fi
+
+# ============================================================================
+# Clean up 1.x layout leftovers (files the pre-2.x installer left behind)
+# These were at /usr/local/share/zoneinfo/America/<City>. Remove only files
+# that look like Canadian-shim patches: abbreviation pool contains our
+# OFFICIAL_ABBREV. This avoids deleting tzdata's own copies.
+# ============================================================================
+
+if [[ "$SCOPE" == "system" ]] && [[ -d "/usr/local/share/zoneinfo/America" ]] \
+   && [[ -f "$CONFIG_FILE" ]] && command -v custom_zones_parse_file >/dev/null 2>&1; then
+    while IFS=$'\t' read -r src _id iab oab _name _u; do
+        [[ -z "$src" ]] && continue
+        legacy="/usr/local/share/zoneinfo/${src}"
+        [[ -f "$legacy" ]] || continue
+        # Confirm the file's post-switch abbreviation is our official abbr
+        # (i.e. it's a shim patch, not a stock tzdata copy that got placed here).
+        pool="$(python3 - "$legacy" <<'PY'
+import struct, sys
+d=open(sys.argv[1],'rb').read()
+if d[:4] != b'TZif':
+    sys.exit(0)
+c1=struct.unpack('>6I', d[20:44]); v1=44+c1[3]*4+c1[3]+c1[4]*6+c1[5]+c1[2]*12+c1[1]+c1[0]
+if v1+44 > len(d) or d[v1:v1+4] != b'TZif':
+    sys.exit(0)
+c2=struct.unpack('>6I', d[v1+20:v1+44])
+p=v1+44+c2[3]*8+c2[3]+c2[4]*6
+sys.stdout.write(d[p:p+c2[5]].replace(b'\x00', b'|').decode('latin-1'))
+PY
+)"
+        if [[ "$pool" == *"${oab}"* ]] && [[ "$pool" != *"${iab}"* ]]; then
+            rm -f -- "$legacy"
+            info "  removed 1.x leftover ${legacy}"
+        else
+            warn "  skipped /usr/local/share/zoneinfo/${src} (not a shim patch)"
+        fi
+    done < <(custom_zones_parse_file "$CONFIG_FILE")
+    # Prune empty subdirs under /usr/local/share/zoneinfo if any exist
+    if [[ -d /usr/local/share/zoneinfo/America ]] \
+       && [[ -z "$(ls -A /usr/local/share/zoneinfo/America 2>/dev/null)" ]]; then
+        rmdir /usr/local/share/zoneinfo/America 2>/dev/null || true
     fi
 fi
 
-# Check for legacy installation directories
-for legacy_dir in "${HOME}/.zoneinfo" "${HOME}/.tzinfo"; do
-    if [[ -d "$legacy_dir" && "$legacy_dir" != "$ZONEINFO_DIR" ]]; then
-        warn "Found legacy installation directory: $legacy_dir"
-        warn "This may be from an older version of the shim"
-        warn "Remove it manually if no longer needed: rm -rf $legacy_dir"
-    fi
+# ============================================================================
+# Prune empty Canadian/ namespace directory
+# ============================================================================
+
+if [[ -d "${ZONEINFO_DIR}/Canadian" ]] \
+   && [[ -z "$(ls -A "${ZONEINFO_DIR}/Canadian" 2>/dev/null)" ]]; then
+    rmdir "${ZONEINFO_DIR}/Canadian" 2>/dev/null || true
+fi
+
+# ============================================================================
+# Remove state + config
+# ============================================================================
+
+if [[ -d "$STATE_DIR" ]]; then
+    rm -rf -- "$STATE_DIR"
+    info "Removed state directory: $STATE_DIR"
+fi
+if [[ -f "$CONFIG_PATH" ]]; then
+    rm -f -- "$CONFIG_PATH"
+    info "Removed config: $CONFIG_PATH"
+fi
+
+# Legacy config locations
+for legacy in "${HOME}/.tzshim.conf" "${HOME}/.config/canadian-tz-shim.conf"; do
+    [[ -f "$legacy" ]] && { rm -f "$legacy"; info "Removed legacy config: $legacy"; }
 done
+
+# Legacy user-level ~/.zoneinfo directory from pre-1.x releases
+if [[ -d "${HOME}/.zoneinfo" ]]; then
+    warn "Legacy directory ${HOME}/.zoneinfo still exists (from a very old shim)."
+    warn "Not removed automatically. Delete manually if unneeded:"
+    warn "  rm -rf ${HOME}/.zoneinfo"
+fi
 
 info "✓ Uninstallation complete."
 echo ""
 
-if [[ "$SYSTEM_WIDE" == "false" ]]; then
-    echo "Remember to remove the TZ export from your shell profile if you added it:"
-    echo ""
-    echo "    export TZ=\$HOME/.tzinfo/America/Vancouver"
+if [[ "$SCOPE" == "user" ]]; then
+    echo "Remember to remove any TZ= export from your shell profile."
     echo ""
 fi
 
 if [[ "$restoration_failed" == "true" && "$FORCE" == "true" ]]; then
-    warn "Note: /etc/localtime was not restored due to missing metadata"
-    warn "You may need to manually set your timezone:"
+    warn "Note: /etc/localtime was not restored due to missing metadata."
+    warn "You may need to set your timezone manually:"
     warn "  sudo ln -sf /usr/share/zoneinfo/YOUR_TIMEZONE /etc/localtime"
-    echo ""
 fi
